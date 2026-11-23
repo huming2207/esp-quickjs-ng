@@ -77,10 +77,16 @@ See `examples/basic`, `examples/network` and `examples/bench`.
 - **I/O task** (one, shared): `select()` over the UDP / posix sockets that are being watched, woken by
   an ESP-IDF eventfd when the set changes. It only reports readiness; reads and writes happen in the
   JS task. A watcher is disarmed when it fires and re-armed after its callback, so a busy socket
-  doesn't spin it. This is the only `select()`, and it only ever sees sockets.
+  doesn't spin it.
 - **ws task** (one per open WebSocket): `esp_transport` is blocking (DNS, TLS handshake, frame reads),
   so it lives in its own task, not the JS one. A mutex around the transport keeps mbedTLS from being
-  read and written at once. Sends are synchronous from the JS task.
+  read and written at once. Sends are synchronous from the JS task; while the task is mid-read of a
+  slow frame a send can wait up to 2x `CONFIG_QJS_ESP_WS_IO_TIMEOUT_MS`. Idle, the task blocks in
+  `select()` on its socket plus an eventfd the JS task pokes on `close()`.
+- Idle means blocked: no task polls, so with tickless idle and automatic light sleep the chip sleeps
+  until a timer, a packet or an app event. `examples/network` measures it (0 µs of CPU for the
+  I/O and ws tasks over 3 s idle). `os.sleep()` blocks in `vTaskDelay()` too, rounded up to whole
+  ticks, never busy-waits.
 - Unhandled promise rejections are printed, not `exit(1)`, once the job queue is empty.
   Uncaught errors in callbacks are printed and the loop keeps going.
 
@@ -147,7 +153,7 @@ plus `setNonBlocking(on)` (new: without it `connect()`/`accept()` block the JS t
   `qjs_esp_loop_run()`. Use `posix-socket`'s `poll()`.
 - As upstream: no global `setTimeout`, use `os.setTimeout`. `os.now()` is in microseconds;
   `performance.now()` is milliseconds.
-- `nanosleep` (for `os.sleep`, via `usleep` → `vTaskDelay`), `utimes` and `lstat` are provided as weak
+- `nanosleep` (for `os.sleep`, `vTaskDelay` only), `utimes` and `lstat` are provided as weak
   symbols in `port/libc_glue.c`.
 
 ### `-fno-strict-aliasing`, and why it matters here

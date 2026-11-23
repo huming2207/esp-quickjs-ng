@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_event.h"
@@ -17,6 +18,30 @@
 #include "qjs_esp.h"
 
 static const char *TAG = "network";
+
+/*
+ * Test helper, not part of the component: CPU time (us) of our tasks and the
+ * idle tasks so far. A task that stays blocked doesn't move its counter, which
+ * is what lets tickless idle put the chip into light sleep.
+ */
+static JSValue js_task_times(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    static TaskStatus_t st[32];
+    UBaseType_t n = uxTaskGetSystemState(st, 32, NULL);
+    JSValue o = JS_NewObject(ctx);
+    uint64_t idle = 0;
+    for (UBaseType_t i = 0; i < n; i++) {
+        const char *name = st[i].pcTaskName;
+        if (!strncmp(name, "IDLE", 4)) {
+            idle += st[i].ulRunTimeCounter;
+        } else if (!strncmp(name, "qjs_", 4) || !strcmp(name, "js")) {
+            /* several qjs_ws tasks would collide, the test opens one */
+            JS_SetPropertyStr(ctx, o, name, JS_NewFloat64(ctx, st[i].ulRunTimeCounter));
+        }
+    }
+    JS_SetPropertyStr(ctx, o, "idle", JS_NewFloat64(ctx, (double)idle));
+    return o;
+}
 
 extern const char main_js[] asm("_binary_main_js_start");
 extern const char main_js_end[] asm("_binary_main_js_end");
@@ -38,6 +63,7 @@ static void js_task(void *arg)
 
     JSValue global = JS_GetGlobalObject(ctx);
     JS_SetPropertyStr(ctx, global, "ECHO_HOST", JS_NewString(ctx, CONFIG_EXAMPLE_ECHO_HOST));
+    JS_SetPropertyStr(ctx, global, "taskTimes", JS_NewCFunction(ctx, js_task_times, "taskTimes", 0));
     JS_FreeValue(ctx, global);
 
     JSValue ret = JS_Eval(ctx, main_js, main_js_end - main_js - 1, "main.js", JS_EVAL_TYPE_MODULE);

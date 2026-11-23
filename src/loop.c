@@ -38,7 +38,8 @@ typedef struct {
     void *arg;
 } ev_t;
 
-#define MAX_REJECTIONS 4
+/* rejections seen in one turn before a .catch() could run; overflow is only counted */
+#define MAX_REJECTIONS 16
 
 struct qjs_esp_loop {
     JSContext *ctx;
@@ -46,6 +47,7 @@ struct qjs_esp_loop {
     TAILQ_HEAD(, qjs_esp_handle) handles;   /* ref'd handles; the loop runs while non-empty */
     JSClassID class_ids[QJS_ESP_CLASS_MAX];
     int n_rej;
+    int rej_dropped;
     struct {
         JSValue promise;
         JSValue reason;
@@ -59,6 +61,12 @@ struct qjs_esp_loop {
         qjs_esp_io_t *w;
         uint16_t gen;
     } slots[CONFIG_QJS_ESP_IO_MAX_WATCHERS];
+    /* I/O task only. Kept here, not on its stack, as they scale with the watcher count */
+    struct {
+        int fd;             /* -1: not in this select() */
+        uint16_t gen;
+    } snap[CONFIG_QJS_ESP_IO_MAX_WATCHERS];
+    ev_t evs[CONFIG_QJS_ESP_IO_MAX_WATCHERS];
     uint8_t *scratch;
 #endif
 };
@@ -82,6 +90,7 @@ int qjs_esp_class_init(JSContext *ctx, int which, const JSClassDef *def)
     }
     JS_NewClassID(rt, &l->class_ids[which]);
     if (JS_NewClass(rt, l->class_ids[which], def)) {
+        l->class_ids[which] = 0;    /* or the next call thinks it's registered */
         JS_ThrowOutOfMemory(ctx);
         return -1;
     }
@@ -124,8 +133,9 @@ void qjs_esp_handle_unref(JSContext *ctx, qjs_esp_handle_t *h)
 
 /* ---- unhandled rejections ----
  * Same idea as quickjs-libc's tracker, but print instead of exit(1), and a
- * fixed table instead of a malloc'd list. If the table is full we just
- * report straight away. */
+ * fixed table instead of a malloc'd list. The tracker runs in the middle of
+ * QuickJS rejecting a promise, so it must never run JS or touch the pending
+ * exception: when the table is full we only count. */
 
 static void report_rejection(JSContext *ctx, JSValueConst reason)
 {
@@ -145,13 +155,16 @@ static void on_rejection(JSContext *ctx, JSValueConst promise, JSValueConst reas
                 JS_FreeValue(ctx, l->rej[i].promise);
                 JS_FreeValue(ctx, l->rej[i].reason);
                 l->rej[i] = l->rej[--l->n_rej];
-                break;
+                return;
             }
+        }
+        if (l->rej_dropped > 0) {
+            l->rej_dropped--;   /* most likely one we couldn't track, now handled */
         }
         return;
     }
     if (l->n_rej == MAX_REJECTIONS) {
-        report_rejection(ctx, reason);
+        l->rej_dropped++;
         return;
     }
     l->rej[l->n_rej].promise = JS_DupValue(ctx, promise);
@@ -159,16 +172,24 @@ static void on_rejection(JSContext *ctx, JSValueConst promise, JSValueConst reas
     l->n_rej++;
 }
 
+/* reporting runs JS (toString, stack getters) which can reject more promises
+ * and refill the table, so take the entry out before touching it */
 static void flush_rejections(qjs_esp_loop_t *l, bool report)
 {
     while (l->n_rej > 0) {
         l->n_rej--;
+        JSValue promise = l->rej[l->n_rej].promise;
+        JSValue reason = l->rej[l->n_rej].reason;
         if (report) {
-            report_rejection(l->ctx, l->rej[l->n_rej].reason);
+            report_rejection(l->ctx, reason);
         }
-        JS_FreeValue(l->ctx, l->rej[l->n_rej].promise);
-        JS_FreeValue(l->ctx, l->rej[l->n_rej].reason);
+        JS_FreeValue(l->ctx, promise);
+        JS_FreeValue(l->ctx, reason);
     }
+    if (l->rej_dropped && report) {
+        fprintf(stderr, "Possibly unhandled promise rejections: %d more (tracking table full)\n", l->rej_dropped);
+    }
+    l->rej_dropped = 0;
 }
 
 /* ---- socket watchers + I/O task ---- */
@@ -194,6 +215,9 @@ void qjs_esp_io_init(qjs_esp_io_t *w, qjs_esp_io_cb_t cb)
 
 int qjs_esp_io_start(qjs_esp_loop_t *l, qjs_esp_io_t *w, int fd, int events)
 {
+    if (fd < 0 || fd >= FD_SETSIZE) {
+        return -EBADF;      /* FD_SET() doesn't check, it'd scribble on the I/O task's stack */
+    }
     xSemaphoreTake(l->io_lock, portMAX_DELAY);
     if (w->slot < 0) {
         int i = 0;
@@ -238,7 +262,7 @@ uint8_t *qjs_esp_loop_scratch(qjs_esp_loop_t *l, size_t *len)
 static void io_task(void *arg)
 {
     qjs_esp_loop_t *l = arg;
-    ev_t evs[CONFIG_QJS_ESP_IO_MAX_WATCHERS];
+    ev_t *evs = l->evs;
 
     while (!l->io_quit) {
         fd_set rd, wr, ex;
@@ -251,9 +275,12 @@ static void io_task(void *arg)
         xSemaphoreTake(l->io_lock, portMAX_DELAY);
         for (int i = 0; i < countof(l->slots); i++) {
             qjs_esp_io_t *w = l->slots[i].w;
+            l->snap[i].fd = -1;
             if (!w || !w->armed) {
                 continue;
             }
+            l->snap[i].fd = w->fd;
+            l->snap[i].gen = l->slots[i].gen;
             if (w->events & QJS_IO_READ) {
                 FD_SET(w->fd, &rd);
             }
@@ -280,12 +307,14 @@ static void io_task(void *arg)
         }
 
         /* Disarm what fired, then post outside the lock: the queue may be full
-         * and the JS task needs the lock to drain it. */
+         * and the JS task needs the lock to drain it. Only trust a slot that
+         * still holds the watcher we selected on: during select() JS may have
+         * stopped it, closed the fd and got the same fd + slot for a new one. */
         int n = 0;
         xSemaphoreTake(l->io_lock, portMAX_DELAY);
         for (int i = 0; i < countof(l->slots); i++) {
             qjs_esp_io_t *w = l->slots[i].w;
-            if (!w || !w->armed) {
+            if (!w || !w->armed || l->snap[i].fd != w->fd || l->snap[i].gen != l->slots[i].gen) {
                 continue;
             }
             int rev = 0;
@@ -346,12 +375,6 @@ static esp_err_t io_init(qjs_esp_loop_t *l)
         return ESP_ERR_NO_MEM;
     }
 
-    /* someone else may have registered it already, that's fine */
-    esp_vfs_eventfd_config_t cfg = ESP_VFS_EVENTD_CONFIG_DEFAULT();
-    esp_err_t err = esp_vfs_eventfd_register(&cfg);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        return err;
-    }
     l->io_wake = eventfd(0, 0);
     if (l->io_wake < 0) {
         return ESP_FAIL;
@@ -443,6 +466,18 @@ qjs_esp_loop_t *qjs_esp_loop_new(JSContext *ctx)
         loop_free(l);
         return NULL;
     }
+#if QJS_ESP_HAVE_IO || CONFIG_QJS_ESP_MOD_WS
+    /* eventfds wake the I/O task and the websocket tasks out of select(), so
+     * idle means blocked, not polling. Someone else may have registered the
+     * VFS already (maybe with fewer fds), that's fine. */
+    esp_vfs_eventfd_config_t cfg = { .max_fds = QJS_ESP_IO_EVENTFDS + QJS_ESP_WS_MAX_OPEN };
+    esp_err_t reg = esp_vfs_eventfd_register(&cfg);
+    if (reg != ESP_OK && reg != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "eventfd VFS: %s", esp_err_to_name(reg));
+        loop_free(l);
+        return NULL;
+    }
+#endif
 #if QJS_ESP_HAVE_IO
     esp_err_t err = io_init(l);
     if (err != ESP_OK) {
@@ -456,10 +491,12 @@ qjs_esp_loop_t *qjs_esp_loop_new(JSContext *ctx)
     return l;
 }
 
-/* round up, or a 5 ms timer on a 10 ms tick spins until it fires */
+/* Round up, or a 5 ms timer on a 10 ms tick spins until it fires. 64-bit:
+ * at 1 kHz a 72 min timer overflows 32 bits. Never portMAX_DELAY, that's "forever". */
 static TickType_t ms_to_ticks(int ms)
 {
-    return ((TickType_t)ms * configTICK_RATE_HZ + 999) / 1000;
+    uint64_t t = ((uint64_t)ms * configTICK_RATE_HZ + 999) / 1000;
+    return t >= portMAX_DELAY ? portMAX_DELAY - 1 : (TickType_t)t;
 }
 
 void qjs_esp_loop_run(qjs_esp_loop_t *l)
@@ -494,6 +531,9 @@ void qjs_esp_loop_run(qjs_esp_loop_t *l)
 
 void qjs_esp_loop_free(qjs_esp_loop_t *l)
 {
+    if (!l) {
+        return;
+    }
     JSRuntime *rt = JS_GetRuntime(l->ctx);
 
     /* Detach everything. Sockets close on the spot; websockets have a task

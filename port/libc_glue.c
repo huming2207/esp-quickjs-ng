@@ -11,23 +11,32 @@
 #include <utime.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 /* weak: if IDF or the app ever grows its own, theirs wins */
 #define GLUE __attribute__((weak))
 
-/* os.sleep(). usleep() in IDF already does vTaskDelay() for anything >= 1 tick
- * and a busy-wait below that, so just feed it. Never interrupted -> rem = 0. */
+/*
+ * os.sleep(). Always blocks in vTaskDelay(), never spins: IDF's usleep()
+ * busy-waits anything under a tick, which keeps the CPU out of light sleep.
+ * Rounded up to whole ticks, +1 because the current tick is partly gone
+ * (POSIX allows sleeping longer). Never interrupted -> rem = 0.
+ */
 GLUE int nanosleep(const struct timespec *req, struct timespec *rem)
 {
     if (!req || req->tv_sec < 0 || req->tv_nsec < 0 || req->tv_nsec >= 1000000000L) {
         errno = EINVAL;
         return -1;
     }
-    uint64_t us = (uint64_t)req->tv_sec * 1000000u + ((uint64_t)req->tv_nsec + 999) / 1000;
-    while (us) {
-        uint32_t chunk = us > 1000000u ? 1000000u : (uint32_t)us;  /* usleep() wants < 1 s */
-        usleep(chunk);
-        us -= chunk;
+    const uint64_t tick_ns = 1000000000ull / configTICK_RATE_HZ;
+    uint64_t sec = req->tv_sec > 1000000000 ? 1000000000 : req->tv_sec;   /* 31 years, no overflow */
+    uint64_t ns = sec * 1000000000ull + req->tv_nsec;
+    uint64_t ticks = ns ? (ns + tick_ns - 1) / tick_ns + 1 : 0;
+    while (ticks) {
+        TickType_t t = ticks > 0x7fffffff ? 0x7fffffff : (TickType_t)ticks;
+        vTaskDelay(t);
+        ticks -= t;
     }
     if (rem) {
         rem->tv_sec = 0;

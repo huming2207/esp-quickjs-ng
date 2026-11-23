@@ -10,6 +10,7 @@ menu "QuickJS-NG"
 
     config QJS_ESP_STACK_MARGIN
         int "Stack kept free for native code (bytes)"
+        range 1024 65536
         default 4096
         help
             qjs_esp_new_runtime() sets the JS recursion limit to the task's
@@ -18,6 +19,7 @@ menu "QuickJS-NG"
 
     config QJS_ESP_EVENT_QUEUE_LEN
         int "Event queue length"
+        range 4 256
         default 16
 
     config QJS_ESP_MOD_UDP
@@ -42,6 +44,7 @@ menu "QuickJS-NG"
 
         config QJS_ESP_IO_TASK_STACK
             int "I/O task stack size"
+            range 2048 16384
             default 3072
 
         config QJS_ESP_IO_TASK_PRIO
@@ -50,6 +53,7 @@ menu "QuickJS-NG"
 
         config QJS_ESP_RX_BUF_SIZE
             int "Receive buffer size"
+            range 512 65536
             default 2048
             help
                 One buffer, shared by all sockets (reads happen in the JS
@@ -59,8 +63,19 @@ menu "QuickJS-NG"
     menu "WebSocket"
         depends on QJS_ESP_MOD_WS
 
+        config QJS_ESP_WS_MAX_OPEN
+            int "Max open websockets"
+            range 1 32
+            default 4
+            help
+                Each open websocket has an eventfd so its task can block in
+                select() instead of polling (lets the chip light-sleep). This
+                sizes the eventfd table, if nobody registered it before us.
+                One more than this fails with EMFILE.
+
         config QJS_ESP_WS_MAX_MESSAGE
             int "Max message size"
+            range 256 1048576
             default 4096
             help
                 Per-connection receive buffer, allocated when connecting.
@@ -79,6 +94,7 @@ menu "QuickJS-NG"
 
         config QJS_ESP_WS_TASK_STACK
             int "Connection task stack size"
+            range 4096 32768
             default 6144
             help
                 One task per open websocket. It does DNS, the TLS handshake
@@ -86,7 +102,7 @@ menu "QuickJS-NG"
 
         config QJS_ESP_WS_TASK_STACK_PSRAM
             bool "Put connection task stacks in PSRAM"
-            depends on SPIRAM
+            depends on SPIRAM && FREERTOS_TASK_CREATE_ALLOW_EXT_MEM
             default n
             help
                 Saves internal RAM. Fine as long as nothing in the task
@@ -98,10 +114,12 @@ menu "QuickJS-NG"
 
         config QJS_ESP_WS_CONNECT_TIMEOUT_MS
             int "Connect timeout (ms)"
+            range 1000 120000
             default 10000
 
         config QJS_ESP_WS_IO_TIMEOUT_MS
             int "Send / partial frame timeout (ms)"
+            range 100 60000
             default 5000
     endmenu
 

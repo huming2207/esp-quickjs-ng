@@ -36,6 +36,7 @@ typedef struct {
     qjs_esp_io_t io;
     JSContext *ctx;
     int fd;                 /* -1 once closed */
+    bool stream;            /* SOCK_STREAM: 0 bytes means EOF, not an empty datagram */
     int poll_events;        /* EV_* as asked for */
     JSValue poll_cb;
 } psock_t;
@@ -97,18 +98,26 @@ static void psock_on_ready(qjs_esp_io_t *w, int revents)
     JSContext *ctx = s->ctx;
     int ev = revents & (EV_READABLE | EV_WRITABLE);     /* same bits as QJS_IO_* */
 
-    /* lwIP has no POLLRDHUP: a closed peer shows up as readable EOF */
+    /* lwIP has no POLLRDHUP: a closed peer shows up as readable EOF, a reset
+     * one as a read error. poll() only allows DISCONNECT together with
+     * READABLE, so the level-triggered watch can't spin on unread data. */
+    int status = 0;
     uint8_t b;
-    if ((s->poll_events & EV_DISCONNECT) && (revents & QJS_IO_READ) &&
-        recv(s->fd, &b, 1, MSG_PEEK | MSG_DONTWAIT) == 0) {
-        ev |= EV_DISCONNECT;
+    if ((s->poll_events & EV_DISCONNECT) && (revents & QJS_IO_READ)) {
+        ssize_t r = recv(s->fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (r == 0 && s->stream) {
+            ev |= EV_DISCONNECT;
+        } else if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            status = -errno;   /* like uv_poll_cb */
+            ev |= EV_DISCONNECT;
+        }
     }
     ev &= s->poll_events;
     if (!ev) {
         return;
     }
     JSValue self = JS_DupValue(ctx, s->h.obj);  /* callback may pollStop()/close() */
-    JSValue args[2] = { JS_NewInt32(ctx, 0), JS_NewInt32(ctx, ev) };
+    JSValue args[2] = { JS_NewInt32(ctx, status), JS_NewInt32(ctx, ev) };
     qjs_esp_call(ctx, s->poll_cb, self, 2, args);
     JS_FreeValue(ctx, self);
 }
@@ -143,9 +152,12 @@ static const JSClassDef psock_class = {
 };
 
 /* takes ownership of fd, closes it on failure */
-static JSValue psock_wrap(JSContext *ctx, int fd)
+static JSValue psock_wrap(JSContext *ctx, JSValueConst new_target, int fd)
 {
-    JSValue obj = JS_NewObjectClass(ctx, qjs_esp_class_id(ctx, QJS_ESP_CLASS_SOCK));
+    int type = 0;
+    socklen_t tl = sizeof(type);
+    getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tl);
+    JSValue obj = qjs_esp_new_obj(ctx, new_target, QJS_ESP_CLASS_SOCK);
     psock_t *s = JS_IsException(obj) ? NULL : js_mallocz(ctx, sizeof(*s));
     if (!s) {
         close(fd);
@@ -156,6 +168,7 @@ static JSValue psock_wrap(JSContext *ctx, int fd)
     qjs_esp_io_init(&s->io, psock_on_ready);
     s->ctx = ctx;
     s->fd = fd;
+    s->stream = type == SOCK_STREAM;
     s->poll_cb = JS_UNDEFINED;
     JS_SetOpaque(obj, s);
     return obj;
@@ -169,7 +182,7 @@ static JSValue psock_ctor(JSContext *ctx, JSValueConst new_target, int argc, JSV
         return JS_EXCEPTION;
     }
     int fd = socket(domain, type, proto);
-    return fd < 0 ? throw_errno(ctx) : psock_wrap(ctx, fd);
+    return fd < 0 ? throw_errno(ctx) : psock_wrap(ctx, new_target, fd);
 }
 
 static JSValue psock_from_fd(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
@@ -178,10 +191,13 @@ static JSValue psock_from_fd(JSContext *ctx, JSValueConst this_val, int argc, JS
     if (JS_ToInt32(ctx, &fd, argv[0])) {
         return JS_EXCEPTION;
     }
-    if (fcntl(fd, F_GETFL) < 0) {
-        return JS_ThrowTypeError(ctx, "%d is not a valid file descriptor: %s", (int)fd, strerror(errno));
+    /* sockets only: not a file, not the loop's eventfd */
+    int type;
+    socklen_t tl = sizeof(type);
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tl) < 0) {
+        return JS_ThrowTypeError(ctx, "%d is not a socket: %s", (int)fd, strerror(errno));
     }
-    return psock_wrap(ctx, fd);
+    return psock_wrap(ctx, JS_UNDEFINED, fd);
 }
 
 static JSValue psock_bind_connect(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int is_connect)
@@ -208,9 +224,14 @@ static JSValue psock_accept(JSContext *ctx, JSValueConst this_val, int argc, JSV
     if (fd < 0) {
         return throw_errno(ctx);
     }
-    JSValue obj = psock_wrap(ctx, fd);
-    if (!JS_IsException(obj)) {
-        JS_SetPropertyStr(ctx, obj, "_sockaddr", JS_NewUint8ArrayCopy(ctx, (uint8_t *)&ss, len));
+    JSValue obj = psock_wrap(ctx, JS_UNDEFINED, fd);
+    if (JS_IsException(obj)) {
+        return obj;     /* fd closed by psock_wrap() */
+    }
+    JSValue sa = JS_NewUint8ArrayCopy(ctx, (uint8_t *)&ss, len);
+    if (JS_IsException(sa) || JS_SetPropertyStr(ctx, obj, "_sockaddr", sa) < 0) {
+        JS_FreeValue(ctx, obj);     /* closes fd */
+        return JS_EXCEPTION;
     }
     return obj;
 }
@@ -242,6 +263,9 @@ static JSValue psock_set_nonblocking(JSContext *ctx, JSValueConst this_val, int 
         return JS_EXCEPTION;
     }
     int fl = fcntl(s->fd, F_GETFL);
+    if (fl < 0) {
+        return throw_errno(ctx);
+    }
     fl = JS_ToBool(ctx, argv[0]) ? fl | O_NONBLOCK : fl & ~O_NONBLOCK;
     return fcntl(s->fd, F_SETFL, fl) < 0 ? throw_errno(ctx) : JS_UNDEFINED;
 }
@@ -302,7 +326,7 @@ static JSValue psock_recv(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     if (r < 0) {
         return throw_errno(ctx);
     }
-    return r == 0 ? JS_NULL : JS_NewUint8ArrayCopy(ctx, buf, r);
+    return r == 0 && s->stream ? JS_NULL : JS_NewUint8ArrayCopy(ctx, buf, r);
 }
 
 static JSValue psock_write(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
@@ -343,11 +367,21 @@ static JSValue psock_recvmsg(JSContext *ctx, JSValueConst this_val, int argc, JS
         return throw_errno(ctx);
     }
     JSValue ret = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, ret, "addr", JS_NewUint8ArrayCopy(ctx, (uint8_t *)&ss, m.msg_namelen));
-    if (ctrl_want) {
-        JS_SetPropertyStr(ctx, ret, "control", JS_NewUint8ArrayCopy(ctx, ctrl, m.msg_controllen));
+    JSValue addr = JS_NewUint8ArrayCopy(ctx, (uint8_t *)&ss, m.msg_namelen);
+    JSValue data = JS_NewUint8ArrayCopy(ctx, buf, r);
+    JSValue cm = ctrl_want ? JS_NewUint8ArrayCopy(ctx, ctrl, m.msg_controllen) : JS_UNDEFINED;
+    if (JS_IsException(ret) || JS_IsException(addr) || JS_IsException(data) || JS_IsException(cm)) {
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, addr);
+        JS_FreeValue(ctx, data);
+        JS_FreeValue(ctx, cm);
+        return JS_EXCEPTION;    /* the datagram is gone, nothing to do about that */
     }
-    JS_SetPropertyStr(ctx, ret, "data", JS_NewUint8ArrayCopy(ctx, buf, r));
+    JS_SetPropertyStr(ctx, ret, "addr", addr);
+    if (ctrl_want) {
+        JS_SetPropertyStr(ctx, ret, "control", cm);
+    }
+    JS_SetPropertyStr(ctx, ret, "data", data);
     return ret;
 }
 
@@ -374,10 +408,10 @@ static JSValue psock_sendmsg(JSContext *ctx, JSValueConst this_val, int argc, JS
     if (JS_ToInt32(ctx, &flags, argv[2])) {
         return JS_EXCEPTION;
     }
-    if (!JS_IsUndefined(argv[0]) && get_sockaddr(ctx, argv[0], &ss, &ss_len)) {
+    if (!JS_IsUndefined(argv[0]) && !JS_IsNull(argv[0]) && get_sockaddr(ctx, argv[0], &ss, &ss_len)) {
         return JS_EXCEPTION;
     }
-    if (!JS_IsUndefined(argv[1])) {
+    if (!JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
         uint8_t *p;
         if (qjs_esp_get_bytes(ctx, argv[1], &p, &ctrl_len)) {
             return JS_EXCEPTION;
@@ -419,12 +453,14 @@ static JSValue psock_poll(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     if (!JS_IsFunction(ctx, argv[1])) {
         return JS_ThrowTypeError(ctx, "callback must be a function");
     }
-    int io = events & (EV_READABLE | EV_WRITABLE);
-    if (events & EV_DISCONNECT) {
-        io |= QJS_IO_READ;
+    /* lwIP has no OOB data, and no way to wait for EOF without also waking
+     * on data: DISCONNECT needs READABLE, PRIORITIZED alone is useless */
+    if ((events & EV_DISCONNECT) && !(events & EV_READABLE)) {
+        return qjs_esp_throw_errno(ctx, ENOTSUP);
     }
+    int io = events & (EV_READABLE | EV_WRITABLE);
     if (!io) {
-        return qjs_esp_throw_errno(ctx, ENOTSUP);   /* PRIORITIZED only: no OOB in lwIP */
+        return qjs_esp_throw_errno(ctx, ENOTSUP);
     }
     int r = qjs_esp_io_start(qjs_esp_loop_get(ctx), &s->io, s->fd, io);
     if (r) {
@@ -562,7 +598,10 @@ static JSValue ns_checksum(JSContext *ctx, JSValueConst this_val, int argc, JSVa
     if (qjs_esp_get_bytes(ctx, argv[0], &p, &n)) {
         return JS_EXCEPTION;
     }
-    uint32_t acc = 0xffff;  /* same seed as txiki: never yields 0x0000 */
+    /* same seed as txiki, so same results. Differs from a 0 seed only when
+     * the sum is zero: 0x0000 instead of 0xffff. Mind that for UDP, where a
+     * zero checksum on the wire means "none" (RFC 768: send 0xffff instead) */
+    uint64_t acc = 0xffff;  /* 64 bits: no lost carries on big buffers */
     for (size_t i = 0; i + 1 < n; i += 2) {
         acc += (uint32_t)p[i] << 8 | p[i + 1];
     }
@@ -583,7 +622,7 @@ static const JSCFunctionListEntry defines[] = {
     DEF(SOCK_STREAM), DEF(SOCK_DGRAM), DEF(SOCK_RAW),
     DEF(SOL_SOCKET),
     DEF(SO_REUSEADDR), DEF(SO_KEEPALIVE), DEF(SO_LINGER), DEF(SO_BROADCAST),
-    DEF(SO_RCVBUF), DEF(SO_SNDBUF), DEF(SO_RCVTIMEO), DEF(SO_SNDTIMEO),
+    DEF(SO_RCVBUF), DEF(SO_RCVTIMEO), DEF(SO_SNDTIMEO),     /* no SO_SNDBUF in lwIP */
     DEF(SO_ERROR), DEF(SO_TYPE), DEF(SO_BINDTODEVICE),
     DEF(IPPROTO_IP), DEF(IPPROTO_IPV6), DEF(IPPROTO_ICMP), DEF(IPPROTO_TCP), DEF(IPPROTO_UDP),
     DEF(TCP_NODELAY), DEF(TCP_KEEPIDLE), DEF(TCP_KEEPINTVL), DEF(TCP_KEEPCNT),

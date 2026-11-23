@@ -17,6 +17,16 @@
 #define container_of(ptr, type, member) ((type *)((uint8_t *)(ptr) - offsetof(type, member)))
 
 #define QJS_ESP_HAVE_IO (CONFIG_QJS_ESP_MOD_UDP || CONFIG_QJS_ESP_MOD_POSIX_SOCKET)
+#if QJS_ESP_HAVE_IO
+#define QJS_ESP_IO_EVENTFDS 1
+#else
+#define QJS_ESP_IO_EVENTFDS 0
+#endif
+#if CONFIG_QJS_ESP_MOD_WS
+#define QJS_ESP_WS_MAX_OPEN CONFIG_QJS_ESP_WS_MAX_OPEN
+#else
+#define QJS_ESP_WS_MAX_OPEN 0
+#endif
 
 #define countof(a) (sizeof(a) / sizeof((a)[0]))
 
@@ -76,7 +86,8 @@ void qjs_esp_call(JSContext *ctx, JSValueConst fn, JSValueConst this_val, int ar
 /* Error with .message = strerror(err), .errno = err */
 JSValue qjs_esp_errno_error(JSContext *ctx, int err);
 JSValue qjs_esp_throw_errno(JSContext *ctx, int err);
-/* ArrayBuffer or typed array -> pointer + length. Valid until the next JS call. */
+/* ArrayBuffer, typed array or DataView -> pointer + length. Valid until the
+ * next JS call. Never NULL, an empty buffer gives a dummy pointer. */
 int qjs_esp_get_bytes(JSContext *ctx, JSValueConst v, uint8_t **p, size_t *len);
 /* { ip, port } <-> sockaddr */
 int qjs_esp_obj2addr(JSContext *ctx, JSValueConst obj, struct sockaddr_storage *ss, socklen_t *len);
@@ -93,3 +104,6 @@ enum { QJS_ESP_CLASS_UDP, QJS_ESP_CLASS_SOCK, QJS_ESP_CLASS_WS, QJS_ESP_CLASS_MA
 /* Register on first use. 0 = ok, -1 = exception set (e.g. no loop). */
 int qjs_esp_class_init(JSContext *ctx, int which, const JSClassDef *def);
 JSClassID qjs_esp_class_id(JSContext *ctx, int which);
+/* new object of our class, with new.target's prototype so `extends` works.
+ * new_target undefined: plain instance (accept() and friends). */
+JSValue qjs_esp_new_obj(JSContext *ctx, JSValueConst new_target, int which);

@@ -9,8 +9,10 @@
  *     handshake, frame reads), so it lives there, not in the JS task.
  *     The task posts open / message / closed to the loop and is deleted by
  *     the JS task when the closed event is handled.
- *   - one mutex around the transport: the task reads and answers pings,
- *     the JS task sends. mbedTLS can't do both at once.
+ *   - one mutex around every transport call: the task reads and answers
+ *     pings, the JS task sends. mbedTLS can't do both at once. While idle
+ *     the task blocks in select() on the bare socket and an eventfd the JS
+ *     task pokes on close()/abort: no polling, so the chip can light-sleep.
  *   - sends are synchronous, from the JS task, through a fixed tx buffer
  *     (big messages are fragmented); no queue, so bufferedAmount is always 0.
  *   - messages are reassembled into a fixed rx buffer; the task waits until
@@ -20,8 +22,12 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include "esp_vfs_eventfd.h"
+#include <sys/select.h>
+#include <unistd.h>
 #include <strings.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -40,7 +46,6 @@
 #define RX_CAP CONFIG_QJS_ESP_WS_MAX_MESSAGE
 #define TX_CAP CONFIG_QJS_ESP_WS_TX_CHUNK
 #define IO_TIMEOUT_MS CONFIG_QJS_ESP_WS_IO_TIMEOUT_MS
-#define POLL_MS 1000    /* how often the task checks for abort / close timeout */
 
 #if CONFIG_QJS_ESP_WS_TASK_STACK_PSRAM
 #define TASK_CAPS (MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
@@ -61,11 +66,13 @@ typedef struct {
     esp_transport_handle_t ws;
     SemaphoreHandle_t lock;     /* around every transport call after connect */
     TaskHandle_t task;
+    int wake;                   /* eventfd: JS -> task, "look at abort/state" */
 
     bool dead;                  /* transport closed, under lock */
+    bool close_sent;            /* our CLOSE frame is out, under lock */
     volatile uint8_t state;     /* written by the JS task only */
     volatile bool abort;        /* JS -> task: give up now */
-    TickType_t close_deadline;  /* ST_CLOSING: stop waiting for the peer's close */
+    bool open_failed;           /* close() while connecting: report an error too */
 
     /* task side, handed to JS through the queue */
     char host[256];
@@ -91,14 +98,41 @@ static ws_t *ws_get(JSContext *ctx, JSValueConst obj)
     return JS_GetOpaque2(ctx, obj, qjs_esp_class_id(ctx, QJS_ESP_CLASS_WS));
 }
 
-static int ws_write(ws_t *w, int op, const void *p, size_t n)
+/* Caller holds the lock. send_raw() says 0 both for "sent 0 bytes" and for
+ * "socket never got writable", so empty frames check writability first. */
+static int write_locked(ws_t *w, int op, const void *p, size_t n)
 {
-    if (xSemaphoreTake(w->lock, pdMS_TO_TICKS(IO_TIMEOUT_MS)) != pdTRUE) {
+    if (w->dead || (n == 0 && esp_transport_poll_write(w->ws, IO_TIMEOUT_MS) <= 0)) {
         return -1;
     }
-    int r = w->dead ? -1 : esp_transport_ws_send_raw(w->ws, op, p, n, IO_TIMEOUT_MS);
+    return esp_transport_ws_send_raw(w->ws, op, p, n, IO_TIMEOUT_MS) == (int)n ? 0 : -1;
+}
+
+/*
+ * No timeout on the lock: the task only holds it for one read, which its own
+ * IO_TIMEOUT_MS bounds (twice, header + payload). Timing out here instead
+ * would kill a healthy but slow connection.
+ */
+static int ws_write(ws_t *w, int op, const void *p, size_t n)
+{
+    xSemaphoreTake(w->lock, portMAX_DELAY);
+    int r = write_locked(w, op, p, n);
     xSemaphoreGive(w->lock);
-    return r == (int)n ? 0 : -1;
+    return r;
+}
+
+/* At most one CLOSE goes out, whoever gets here first: JS close(), our own
+ * protocol errors, or the echo of the peer's close. 0 if sent now or before. */
+static int send_close(ws_t *w, const uint8_t *p, size_t n)
+{
+    int r = 0;
+    xSemaphoreTake(w->lock, portMAX_DELAY);
+    if (!w->close_sent) {
+        r = write_locked(w, WS_TRANSPORT_OPCODES_CLOSE | WS_TRANSPORT_OPCODES_FIN, p, n);
+        w->close_sent = r == 0;
+    }
+    xSemaphoreGive(w->lock);
+    return r;
 }
 
 /* ---- JS-task side of the events the connection task posts ---- */
@@ -118,6 +152,10 @@ static void ev_open(JSContext *ctx, void *arg)
 static void ev_message(JSContext *ctx, void *arg)
 {
     ws_t *w = arg;
+    if (!JS_IsFunction(ctx, w->cb[CB_MESSAGE])) {
+        xTaskNotifyGive(w->task);   /* nobody listening (or tearing down), don't copy */
+        return;
+    }
     JSValue v = w->msg_op == WS_TRANSPORT_OPCODES_TEXT
                 ? JS_NewStringLen(ctx, (const char *)w->rx, w->rx_len)
                 : JS_NewArrayBufferCopy(ctx, w->rx, w->rx_len);
@@ -126,8 +164,28 @@ static void ev_message(JSContext *ctx, void *arg)
     JS_FreeValue(ctx, v);
 }
 
+static void fail(ws_t *w, const char *msg)
+{
+    if (!w->err[0]) {
+        snprintf(w->err, sizeof(w->err), "%s", msg);
+    }
+}
+
+/* get the task out of select() to look at abort / state */
+static void kick(ws_t *w)
+{
+    uint64_t one = 1;
+    if (w->wake >= 0) {
+        (void)write(w->wake, &one, sizeof(one));
+    }
+}
+
 static void ws_release(ws_t *w)
 {
+    if (w->wake >= 0) {
+        close(w->wake);
+        w->wake = -1;
+    }
     if (w->ws) {
         esp_transport_destroy(w->ws);   /* doesn't take the parent with it */
         w->ws = NULL;
@@ -155,6 +213,9 @@ static void ev_closed(JSContext *ctx, void *arg)
     ws_release(w);
     w->state = ST_CLOSED;
 
+    if (w->open_failed && !w->err[0]) {
+        fail(w, "closed before the connection was established");  /* task is gone, safe */
+    }
     if (w->err[0]) {
         JSValue e = JS_NewString(ctx, w->err);
         qjs_esp_call(ctx, w->cb[CB_ERROR], w->h.obj, 1, &e);
@@ -168,18 +229,11 @@ static void ev_closed(JSContext *ctx, void *arg)
 
 /* ---- connection task ---- */
 
-static void fail(ws_t *w, const char *msg)
-{
-    if (!w->err[0]) {
-        snprintf(w->err, sizeof(w->err), "%s", msg);
-    }
-}
-
 /* we bail out: tell the peer why, report 1006 like browsers do */
 static void fail_with_close(ws_t *w, uint16_t code, const char *msg)
 {
     uint8_t p[2] = { code >> 8, code & 0xff };
-    ws_write(w, WS_TRANSPORT_OPCODES_CLOSE | WS_TRANSPORT_OPCODES_FIN, p, 2);
+    send_close(w, p, 2);
     fail(w, msg);
 }
 
@@ -199,10 +253,8 @@ static int on_control(ws_t *w, uint8_t *p, int n)
             memcpy(w->close_reason, p + 2, n - 2);  /* n <= 125, fits */
             w->close_reason[n - 2] = '\0';
         }
-        if (w->state != ST_CLOSING) {
-            /* peer started it: echo the code back, then we're done */
-            ws_write(w, WS_TRANSPORT_OPCODES_CLOSE | WS_TRANSPORT_OPCODES_FIN, p, n >= 2 ? 2 : 0);
-        }
+        /* peer started it: echo the code back. No-op if ours is already out */
+        send_close(w, p, n >= 2 ? 2 : 0);
         return 1;
     default:
         return 0;   /* pong */
@@ -233,6 +285,12 @@ static int read_some(ws_t *w)
         if (op == WS_TRANSPORT_OPCODES_NONE) {
             return 0;   /* woke up for nothing */
         }
+        /* IDF 6.1's transport rejects these already, older ones may not: a
+         * long control frame would continue into rx unchecked */
+        if (len < 0 || ((op & 0x08) && len > 125)) {
+            fail_with_close(w, 1002, "bad frame length");
+            return 1;
+        }
         w->frame_op = op;
         w->frame_fin = fin;
         w->frame_left = len;
@@ -253,7 +311,7 @@ static int read_some(ws_t *w)
             w->msg_op = w->frame_op;
             w->in_msg = true;
         }
-        if (w->rx_len + len > RX_CAP) {
+        if ((size_t)len > RX_CAP - w->rx_len) {
             fail_with_close(w, 1009, "message too big");
             return 1;
         }
@@ -270,9 +328,60 @@ static int read_some(ws_t *w)
     return 0;
 }
 
+/*
+ * >0 when there's something to read, 0 when kicked or timed out. Data TLS
+ * already decrypted is only visible to mbedTLS, so ask the transport (under
+ * the lock, no waiting); otherwise block on the bare socket, which touches no
+ * TLS state, and the wake eventfd. wait_ms < 0: no timeout.
+ */
+static int wait_readable(ws_t *w, int wait_ms)
+{
+    xSemaphoreTake(w->lock, portMAX_DELAY);
+    int r = esp_transport_poll_read(w->ws, 0);
+    int fd = esp_transport_get_socket(w->ws);
+    xSemaphoreGive(w->lock);
+    if (r != 0) {
+        return r;
+    }
+    if (fd < 0) {
+        return -1;
+    }
+    fd_set rd, ex;
+    FD_ZERO(&rd);
+    FD_ZERO(&ex);
+    FD_SET(fd, &rd);
+    FD_SET(fd, &ex);
+    FD_SET(w->wake, &rd);
+    struct timeval tv = { .tv_sec = wait_ms / 1000, .tv_usec = (wait_ms % 1000) * 1000 };
+    r = select((fd > w->wake ? fd : w->wake) + 1, &rd, NULL, &ex, wait_ms < 0 ? NULL : &tv);
+    if (r < 0) {
+        return -1;
+    }
+    if (FD_ISSET(w->wake, &rd)) {
+        uint64_t v;
+        (void)read(w->wake, &v, sizeof(v));
+    }
+    /* readable or error: either way the read sorts it out */
+    return FD_ISSET(fd, &rd) || FD_ISSET(fd, &ex);
+}
+
+/* ticks until deadline (0 = unset), folded into the select() timeout */
+static int until(TickType_t deadline, TickType_t now, int wait_ms)
+{
+    if (!deadline) {
+        return wait_ms;
+    }
+    int32_t left = (int32_t)(deadline - now);
+    int ms = left <= 0 ? 0 : (int)pdTICKS_TO_MS(left) + 1;
+    return wait_ms < 0 || ms < wait_ms ? ms : wait_ms;
+}
+
 static void ws_task(void *arg)
 {
     ws_t *w = arg;
+    /* task-local, no ordering games with the JS task */
+    TickType_t close_by = 0;    /* set once we see ST_CLOSING */
+    TickType_t frame_by = 0;    /* mid-frame: next bytes due by then */
 
     w->close_code = 1006;
     if (esp_transport_connect(w->ws, w->host, w->port, CONFIG_QJS_ESP_WS_CONNECT_TIMEOUT_MS) < 0) {
@@ -287,16 +396,34 @@ static void ws_task(void *arg)
     qjs_esp_loop_post(w->loop, ev_open, w, portMAX_DELAY);
 
     while (!w->abort) {
-        if (w->state == ST_CLOSING && (int32_t)(xTaskGetTickCount() - w->close_deadline) >= 0) {
+        TickType_t now = xTaskGetTickCount();
+        if (w->state == ST_CLOSING && !close_by) {
+            close_by = (now + pdMS_TO_TICKS(IO_TIMEOUT_MS)) | 1;
+        }
+        if (close_by && (int32_t)(now - close_by) >= 0) {
             break;      /* peer never answered our close, 1006 */
         }
-        int r = esp_transport_poll_read(w->ws, POLL_MS);
+        if (frame_by && (int32_t)(now - frame_by) >= 0) {
+            fail(w, "partial frame timeout");
+            break;
+        }
+        /* idle and open: no timeout, sleep until data or a kick */
+        int r = wait_readable(w, until(frame_by, now, until(close_by, now, -1)));
+        if (w->abort) {
+            break;      /* kicked to stop; don't start a read that can block */
+        }
         if (r < 0) {
             fail(w, "connection lost");
             break;
         }
+        int left = w->frame_left;
         if (r > 0 && read_some(w)) {
             break;
+        }
+        if (w->frame_left == 0) {
+            frame_by = 0;
+        } else if (w->frame_left != left) {
+            frame_by = (xTaskGetTickCount() + pdMS_TO_TICKS(IO_TIMEOUT_MS)) | 1;   /* progress */
         }
     }
 out:
@@ -323,7 +450,8 @@ static void on_header(void *arg, const char *line, int len)
         line++;
         len--;
     }
-    while (len > 0 && (line[len - 1] == ' ' || line[len - 1] == '\r' || line[len - 1] == '\n')) {
+    while (len > 0 && (line[len - 1] == ' ' || line[len - 1] == '\t' || line[len - 1] == '\r' ||
+                       line[len - 1] == '\n')) {
         len--;
     }
     snprintf(w->protocol, sizeof(w->protocol), "%.*s", len, line);
@@ -338,7 +466,8 @@ static void ws_detach(qjs_esp_handle_t *h)
         JS_FreeValue(w->ctx, w->cb[i]);
         w->cb[i] = JS_UNDEFINED;
     }
-    w->abort = true;    /* the task notices within POLL_MS, or when connect returns */
+    w->abort = true;    /* the task notices now, or when connect returns */
+    kick(w);
 }
 
 static void ws_finalizer(JSRuntime *rt, JSValueConst val)
@@ -373,6 +502,14 @@ static const JSClassDef ws_class = {
     .gc_mark = ws_mark,
 };
 
+#define MAX_HEADERS 32
+
+/* no CR/LF/NUL anywhere, no ':' in the name: they'd forge extra header lines */
+static bool header_ok(const char *k, size_t kl, const char *v, size_t vl)
+{
+    return kl && strlen(k) == kl && strlen(v) == vl && !strpbrk(k, "\r\n:") && !strpbrk(v, "\r\n");
+}
+
 /* "Name: value\r\n"... from two parallel arrays. Constructor only. */
 static char *build_headers(JSContext *ctx, JSValueConst names, JSValueConst values)
 {
@@ -383,14 +520,23 @@ static char *build_headers(JSContext *ctx, JSValueConst names, JSValueConst valu
     if (JS_GetLength(ctx, names, &n)) {
         return NULL;
     }
+    if (n > MAX_HEADERS) {
+        JS_ThrowRangeError(ctx, "more than %d headers", MAX_HEADERS);
+        return NULL;
+    }
     for (int64_t i = 0; i < n; i++) {
-        JSValue kv = JS_GetPropertyInt64(ctx, names, i);
-        JSValue vv = JS_GetPropertyInt64(ctx, values, i);
         size_t kl, vl;
+        JSValue kv = JS_GetPropertyInt64(ctx, names, i);
         const char *k = JS_ToCStringLen(ctx, &kl, kv);
-        const char *v = k ? JS_ToCStringLen(ctx, &vl, vv) : NULL;
         JS_FreeValue(ctx, kv);
+        JSValue vv = k ? JS_GetPropertyInt64(ctx, values, i) : JS_UNDEFINED;
+        const char *v = k ? JS_ToCStringLen(ctx, &vl, vv) : NULL;
         JS_FreeValue(ctx, vv);
+        if (v && !header_ok(k, kl, v, vl)) {
+            JS_ThrowTypeError(ctx, "invalid header %s", k);
+            JS_FreeCString(ctx, v);
+            v = NULL;
+        }
         char *nb = v ? js_realloc(ctx, buf, len + kl + vl + 5) : NULL;
         if (nb) {
             len += sprintf(nb + len, "%s: %s\r\n", k, v);
@@ -458,7 +604,7 @@ static char *parse_url(JSContext *ctx, ws_t *w, const char *url, bool *tls)
 /* new WebSocket(url, protocols | null[, headerNames, headerValues]) */
 static JSValue ws_ctor(JSContext *ctx, JSValueConst new_target, int argc, JSValueConst *argv)
 {
-    JSValue obj = JS_NewObjectClass(ctx, qjs_esp_class_id(ctx, QJS_ESP_CLASS_WS));
+    JSValue obj = qjs_esp_new_obj(ctx, new_target, QJS_ESP_CLASS_WS);
     if (JS_IsException(obj)) {
         return obj;
     }
@@ -468,6 +614,7 @@ static JSValue ws_ctor(JSContext *ctx, JSValueConst new_target, int argc, JSValu
         return JS_EXCEPTION;
     }
     qjs_esp_handle_init(&w->h, ws_detach);
+    w->wake = -1;
     w->ctx = ctx;
     w->loop = qjs_esp_loop_get(ctx);
     for (int i = 0; i < CB_MAX; i++) {
@@ -492,6 +639,11 @@ static JSValue ws_ctor(JSContext *ctx, JSValueConst new_target, int argc, JSValu
         goto fail;
     }
 
+    w->wake = eventfd(0, 0);
+    if (w->wake < 0) {
+        qjs_esp_throw_errno(ctx, errno);   /* EMFILE: raise CONFIG_QJS_ESP_WS_MAX_OPEN */
+        goto fail;
+    }
     w->rx = qjs_esp_buf_alloc(RX_CAP);
     w->tx = qjs_esp_buf_alloc(TX_CAP);
     w->lock = xSemaphoreCreateMutex();
@@ -571,6 +723,7 @@ static JSValue ws_send(JSContext *ctx, ws_t *w, int op, const uint8_t *p, size_t
         memcpy(w->tx, p + off, k);
         if (ws_write(w, fop, w->tx, k)) {
             w->abort = true;    /* the stream is broken mid-message, let the task wrap up */
+            kick(w);
             return JS_ThrowInternalError(ctx, "WebSocket send failed");
         }
         off += k;
@@ -628,18 +781,14 @@ static JSValue ws_close(JSContext *ctx, JSValueConst this_val, int argc, JSValue
     if (!w) {
         return JS_EXCEPTION;
     }
-    if (w->state == ST_CONNECTING) {
-        w->state = ST_CLOSING;
-        w->abort = true;    /* fails the connection: error + close(1006) */
-        return JS_UNDEFINED;
-    }
-    if (w->state != ST_OPEN) {
-        return JS_UNDEFINED;
-    }
+    /* convert first: valueOf()/toString() can run JS, even close() again */
     if (argc > 0 && !JS_IsUndefined(argv[0])) {
         int32_t code;
         if (JS_ToInt32(ctx, &code, argv[0])) {
             return JS_EXCEPTION;
+        }
+        if (code != 1000 && (code < 3000 || code > 4999)) {
+            return JS_ThrowRangeError(ctx, "close code must be 1000 or 3000-4999");
         }
         p[0] = code >> 8;
         p[1] = code & 0xff;
@@ -659,11 +808,21 @@ static JSValue ws_close(JSContext *ctx, JSValueConst this_val, int argc, JSValue
             JS_FreeCString(ctx, r);
         }
     }
-    w->close_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(IO_TIMEOUT_MS);
+    if (w->state == ST_CONNECTING) {
+        w->state = ST_CLOSING;
+        w->open_failed = true;  /* fails the connection: error + close(1006) */
+        w->abort = true;        /* connect() can't be woken, it finishes or times out... */
+        kick(w);                /* ...but it may be done already and waiting in select() */
+        return JS_UNDEFINED;
+    }
+    if (w->state != ST_OPEN) {
+        return JS_UNDEFINED;
+    }
     w->state = ST_CLOSING;
-    if (ws_write(w, WS_TRANSPORT_OPCODES_CLOSE | WS_TRANSPORT_OPCODES_FIN, p, n)) {
+    if (send_close(w, p, n)) {
         w->abort = true;
     }
+    kick(w);    /* start the close timeout */
     return JS_UNDEFINED;
 }
 

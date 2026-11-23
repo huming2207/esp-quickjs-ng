@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <net/if.h>
 #include <unistd.h>
+#include "quickjs-libc.h"
 #include "qjs_esp_priv.h"
 
 #if CONFIG_QJS_ESP_MOD_UDP
@@ -36,6 +37,7 @@ typedef struct {
     int fd;
     int af;                 /* AF_UNSPEC until there's a socket */
     bool bound;
+    bool closed;            /* close() is final, nothing brings the socket back */
     JSValue onrecv;
 } udp_t;
 
@@ -49,6 +51,10 @@ static int ensure_sock(JSContext *ctx, udp_t *u, int af)
 {
     if (u->fd >= 0) {
         return 0;
+    }
+    if (u->closed) {
+        qjs_esp_throw_errno(ctx, EBADF);
+        return -1;
     }
     if (u->af != AF_UNSPEC) {
         af = u->af;
@@ -80,6 +86,7 @@ static void udp_close(udp_t *u)
         close(u->fd);
         u->fd = -1;
     }
+    u->closed = true;
     qjs_esp_handle_unref(u->ctx, &u->h);    /* last: may free u */
 }
 
@@ -113,10 +120,20 @@ static void udp_on_readable(qjs_esp_io_t *w, int revents)
             }
             args[1] = qjs_esp_errno_error(ctx, errno);
         } else {
-            args[0] = JS_NewObjectProto(ctx, JS_NULL);
-            JS_DefinePropertyValueStr(ctx, args[0], "data", JS_NewUint8ArrayCopy(ctx, buf, n), JS_PROP_C_W_E);
-            JS_DefinePropertyValueStr(ctx, args[0], "partial", JS_NewBool(ctx, m.msg_flags & MSG_TRUNC), JS_PROP_C_W_E);
-            JS_DefinePropertyValueStr(ctx, args[0], "addr", qjs_esp_addr2obj(ctx, (struct sockaddr *)&ss), JS_PROP_C_W_E);
+            JSValue data = JS_NewUint8ArrayCopy(ctx, buf, n);
+            JSValue addr = qjs_esp_addr2obj(ctx, (struct sockaddr *)&ss);
+            JSValue o = JS_NewObjectProto(ctx, JS_NULL);
+            if (JS_IsException(data) || JS_IsException(addr) || JS_IsException(o)) {
+                JS_FreeValue(ctx, data);    /* out of memory: drop this one */
+                JS_FreeValue(ctx, addr);
+                JS_FreeValue(ctx, o);
+                js_std_dump_error(ctx);
+                break;
+            }
+            JS_DefinePropertyValueStr(ctx, o, "data", data, JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, o, "partial", JS_NewBool(ctx, m.msg_flags & MSG_TRUNC), JS_PROP_C_W_E);
+            JS_DefinePropertyValueStr(ctx, o, "addr", addr, JS_PROP_C_W_E);
+            args[0] = o;
         }
         qjs_esp_call(ctx, u->onrecv, self, 2, args);
         JS_FreeValue(ctx, args[0]);
@@ -164,7 +181,7 @@ static JSValue udp_ctor(JSContext *ctx, JSValueConst new_target, int argc, JSVal
     if (argc > 0 && !JS_IsUndefined(argv[0]) && JS_ToInt32(ctx, &af, argv[0])) {
         return JS_EXCEPTION;
     }
-    JSValue obj = JS_NewObjectClass(ctx, qjs_esp_class_id(ctx, QJS_ESP_CLASS_UDP));
+    JSValue obj = qjs_esp_new_obj(ctx, new_target, QJS_ESP_CLASS_UDP);
     if (JS_IsException(obj)) {
         return obj;
     }
@@ -278,7 +295,7 @@ static JSValue udp_send(JSContext *ctx, JSValueConst this_val, int argc, JSValue
         return JS_EXCEPTION;
     }
     /* address first: parsing it can run JS, which could detach the buffer */
-    bool to = argc > 1 && !JS_IsUndefined(argv[1]);
+    bool to = argc > 1 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1]);
     if (to && (qjs_esp_obj2addr(ctx, argv[1], &ss, &len) || ensure_sock(ctx, u, ss.ss_family))) {
         return JS_EXCEPTION;
     }
@@ -315,6 +332,9 @@ static JSValue udp_start_recv(JSContext *ctx, JSValueConst this_val, int argc, J
             return qjs_esp_throw_errno(ctx, errno);
         }
         u->bound = true;
+    }
+    if (need_sock(ctx, u)) {
+        return JS_EXCEPTION;
     }
     int r = qjs_esp_io_start(qjs_esp_loop_get(ctx), &u->io, u->fd, QJS_IO_READ);
     if (r) {
@@ -424,7 +444,7 @@ static JSValue udp_setopt(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     }
 
     int r;
-    uint8_t v8 = v;     /* lwIP wants u8_t for the v4 multicast knobs */
+    uint8_t v8 = v;     /* lwIP wants u8_t for the multicast knobs, v4 and v6 */
     if (which == OPT_BROADCAST) {
         r = setsockopt(u->fd, SOL_SOCKET, SO_BROADCAST, &v, sizeof(v));
     } else if (u->af == AF_INET) {
@@ -433,7 +453,7 @@ static JSValue udp_setopt(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     } else {
 #if CONFIG_LWIP_IPV6
         int opt = which == OPT_MCAST_TTL ? IPV6_MULTICAST_HOPS : IPV6_MULTICAST_LOOP;
-        r = setsockopt(u->fd, IPPROTO_IPV6, opt, &v, sizeof(v));
+        r = setsockopt(u->fd, IPPROTO_IPV6, opt, &v8, sizeof(v8));
 #else
         r = -1;
         errno = EAFNOSUPPORT;
@@ -462,7 +482,7 @@ static JSValue udp_set_mcast_iface(JSContext *ctx, JSValueConst this_val, int ar
 #if CONFIG_LWIP_IPV6
     struct sockaddr_in6 a6;
     if (u->af == AF_INET6 && qjs_esp_parse_ip6(iface, &a6)) {
-        int idx = a6.sin6_scope_id;
+        uint8_t idx = a6.sin6_scope_id;    /* lwIP netif indexes are u8_t */
         r = setsockopt(u->fd, IPPROTO_IPV6, IPV6_MULTICAST_IF, &idx, sizeof(idx));
         err = errno;
     }

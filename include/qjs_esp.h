@@ -44,8 +44,11 @@ qjs_esp_loop_t *qjs_esp_loop_new(JSContext *ctx);
  * are printed and the loop keeps going. */
 void qjs_esp_loop_run(qjs_esp_loop_t *loop);
 
-/* Close every open handle, stop the tasks, free the loop. JS callbacks are
- * not called during teardown. Call before JS_FreeContext(). */
+/* Close every open handle, stop the tasks, free the loop. The modules' JS
+ * callbacks (onrecv, onmessage...) don't fire during teardown, but work you
+ * queued with qjs_esp_loop_post() still runs, so it can free its arg. A
+ * websocket still connecting holds this up to its connect timeout.
+ * Call before JS_FreeContext(). NULL is fine. */
 void qjs_esp_loop_free(qjs_esp_loop_t *loop);
 
 /* Queue cb(ctx, arg) to run in the JS task. Any task; not ISRs. */
