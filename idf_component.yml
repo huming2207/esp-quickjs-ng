@@ -1,0 +1,5 @@
+version: "0.18.0"
+description: QuickJS-NG for ESP-IDF, with a FreeRTOS event loop and udp / websocket / posix-socket modules
+license: MIT
+dependencies:
+  idf: ">=6.0"

@@ -1,0 +1,8 @@
+menu "Example"
+    config EXAMPLE_ECHO_HOST
+        string "Echo server address"
+        default "10.0.2.1"
+        help
+            Where tools/echo_server.py runs. 10.0.2.1 is the host as seen from
+            esp-emu with --net user,net=10.0.2.0/24.
+endmenu

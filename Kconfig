@@ -1,0 +1,108 @@
+menu "QuickJS-NG"
+
+    config QJS_ESP_HEAP_PREFER_PSRAM
+        bool "Put the JS heap in PSRAM"
+        depends on SPIRAM
+        default y
+        help
+            qjs_esp_new_runtime() allocates from PSRAM first and falls back
+            to internal RAM.
+
+    config QJS_ESP_STACK_MARGIN
+        int "Stack kept free for native code (bytes)"
+        default 4096
+        help
+            qjs_esp_new_runtime() sets the JS recursion limit to the task's
+            free stack minus this. Native calls made at max JS depth (printf,
+            TLS writes...) run in this space.
+
+    config QJS_ESP_EVENT_QUEUE_LEN
+        int "Event queue length"
+        default 16
+
+    config QJS_ESP_MOD_UDP
+        bool "udp module"
+        default y
+
+    config QJS_ESP_MOD_POSIX_SOCKET
+        bool "posix-socket module"
+        default y
+
+    config QJS_ESP_MOD_WS
+        bool "ws (WebSocket client) module"
+        default y
+
+    menu "Socket I/O"
+        depends on QJS_ESP_MOD_UDP || QJS_ESP_MOD_POSIX_SOCKET
+
+        config QJS_ESP_IO_MAX_WATCHERS
+            int "Max sockets watched at once"
+            range 1 64
+            default 8
+
+        config QJS_ESP_IO_TASK_STACK
+            int "I/O task stack size"
+            default 3072
+
+        config QJS_ESP_IO_TASK_PRIO
+            int "I/O task priority"
+            default 5
+
+        config QJS_ESP_RX_BUF_SIZE
+            int "Receive buffer size"
+            default 2048
+            help
+                One buffer, shared by all sockets (reads happen in the JS
+                task). Bigger UDP datagrams are truncated and flagged partial.
+    endmenu
+
+    menu "WebSocket"
+        depends on QJS_ESP_MOD_WS
+
+        config QJS_ESP_WS_MAX_MESSAGE
+            int "Max message size"
+            default 4096
+            help
+                Per-connection receive buffer, allocated when connecting.
+                Bigger messages close the connection with 1009.
+
+        config QJS_ESP_WS_TX_CHUNK
+            int "Send buffer size"
+            range 128 4096
+            default 1024
+            help
+                Per-connection send buffer, allocated when connecting.
+                Bigger messages go out as several frames (RFC 6455
+                fragmentation). The transport masks the payload in place, so
+                JS memory is never handed to it directly. Keep it at or below
+                the mbedTLS max out fragment length.
+
+        config QJS_ESP_WS_TASK_STACK
+            int "Connection task stack size"
+            default 6144
+            help
+                One task per open websocket. It does DNS, the TLS handshake
+                and reads.
+
+        config QJS_ESP_WS_TASK_STACK_PSRAM
+            bool "Put connection task stacks in PSRAM"
+            depends on SPIRAM
+            default n
+            help
+                Saves internal RAM. Fine as long as nothing in the task
+                touches flash with the cache disabled (esp_transport doesn't).
+
+        config QJS_ESP_WS_TASK_PRIO
+            int "Connection task priority"
+            default 5
+
+        config QJS_ESP_WS_CONNECT_TIMEOUT_MS
+            int "Connect timeout (ms)"
+            default 10000
+
+        config QJS_ESP_WS_IO_TIMEOUT_MS
+            int "Send / partial frame timeout (ms)"
+            default 5000
+    endmenu
+
+endmenu
