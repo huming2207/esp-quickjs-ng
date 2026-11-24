@@ -24,7 +24,7 @@ idf_component_register(
         "src/mod_ws.c"
     INCLUDE_DIRS "include" "quickjs"
     PRIV_INCLUDE_DIRS "port/include" "src"
-    PRIV_REQUIRES vfs lwip tcp_transport esp-tls mbedtls http_parser
+    PRIV_REQUIRES vfs lwip tcp_transport esp-tls mbedtls http_parser esp_timer heap
 )
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE _GNU_SOURCE)

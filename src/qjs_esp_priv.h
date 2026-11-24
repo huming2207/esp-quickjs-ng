@@ -48,6 +48,15 @@ void qjs_esp_handle_unref(JSContext *ctx, qjs_esp_handle_t *h);
 
 qjs_esp_loop_t *qjs_esp_loop_get(JSContext *ctx);
 
+/* Budget check shared by the interrupt handler and the arena allocator.
+ * 1 = stopped. Reading the clock is the costly part, so it's optional. */
+int qjs_esp_loop_check(qjs_esp_loop_t *l, bool read_clock);
+
+/* The arena rt lives in, or NULL. The loop binds itself to it so allocations
+ * also check the budget; NULL unbinds. */
+qjs_esp_arena_t *qjs_esp_arena_of(JSRuntime *rt);
+void qjs_esp_arena_bind(qjs_esp_arena_t *a, qjs_esp_loop_t *l);
+
 /*
  * Socket readiness, the uv_poll_t equivalent. The I/O task select()s on armed
  * watchers and posts hits to the JS task; the callback runs there and the

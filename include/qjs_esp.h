@@ -6,6 +6,8 @@
  */
 #pragma once
 
+#include <stddef.h>
+#include <stdint.h>
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "quickjs.h"
@@ -22,7 +24,56 @@ extern "C" {
  */
 JSRuntime *qjs_esp_new_runtime(void);
 
+/*
+ * Private heap for one runtime, for running code you don't trust to behave.
+ * qjs_esp_new_runtime() shares the system heap and falls back to internal RAM;
+ * a runtime in an arena can only ever use the arena, and QuickJS throws "out
+ * of memory" a little before it's full.
+ *
+ * Grab it once at boot (e.g. MALLOC_CAP_SPIRAM): it's never freed. Up to 4.
+ * Only the JS task may touch it.
+ */
+typedef struct qjs_esp_arena qjs_esp_arena_t;
+
+qjs_esp_arena_t *qjs_esp_arena_new(size_t size, uint32_t caps);
+
+/* Like qjs_esp_new_runtime(), but every allocation comes from the arena.
+ * One runtime per arena at a time: NULL if the arena isn't empty. */
+JSRuntime *qjs_esp_new_runtime_in(qjs_esp_arena_t *a);
+
+/*
+ * Drop everything in the arena at once, instead of JS_FreeRuntime(). For
+ * after a script was stopped or ran out of memory, when the runtime may not
+ * free cleanly (JS_FreeRuntime() asserts on any leaked object).
+ * Call qjs_esp_loop_free() first: it stops the tasks that point into the
+ * arena. Skip js_std_free_handlers / JS_FreeContext / JS_FreeRuntime. Only
+ * arena memory comes back: FILEs opened through qjs:std leak.
+ */
+void qjs_esp_arena_reset(qjs_esp_arena_t *a);
+
+/* Bytes in use now, and the most ever in use since the last reset. */
+size_t qjs_esp_arena_used(const qjs_esp_arena_t *a);
+size_t qjs_esp_arena_peak(const qjs_esp_arena_t *a);
+
 typedef struct qjs_esp_loop qjs_esp_loop_t;
+
+/* Why qjs_esp_loop_run() returned. Anything but IDLE is final: free the loop. */
+typedef enum {
+    QJS_ESP_STOP_IDLE = 0,      /* no timers, jobs or open handles left */
+    QJS_ESP_STOP_REQUESTED,     /* qjs_esp_loop_stop() */
+    QJS_ESP_STOP_DEADLINE,      /* qjs_esp_loop_set_deadline() passed */
+    QJS_ESP_STOP_SLICE,         /* one turn ran longer than slice_ms */
+} qjs_esp_stop_t;
+
+typedef struct {
+    /* Longest one turn may run: a callback, or a batch of promise jobs plus
+     * one timer. Catches while(1), endless job chains and regexp blowups.
+     * 0: no limit. */
+    uint32_t slice_ms;
+    /* After this much JS without blocking, vTaskDelay(1) so lower priority
+     * tasks, the idle task and the task WDT get to run. 0: never. */
+    uint32_t yield_ms;
+} qjs_esp_limits_t;
 
 /* Runs in the JS task. */
 typedef void (*qjs_esp_work_cb_t)(JSContext *ctx, void *arg);
@@ -40,9 +91,22 @@ typedef void (*qjs_esp_work_cb_t)(JSContext *ctx, void *arg);
  */
 qjs_esp_loop_t *qjs_esp_loop_new(JSContext *ctx);
 
-/* Run until there are no timers, jobs or open handles left. Uncaught errors
- * are printed and the loop keeps going. */
-void qjs_esp_loop_run(qjs_esp_loop_t *loop);
+/* Run until there are no timers, jobs or open handles left, or until it's
+ * stopped (see qjs_esp_stop_t). Uncaught errors are printed and the loop keeps
+ * going. */
+qjs_esp_stop_t qjs_esp_loop_run(qjs_esp_loop_t *loop);
+
+/* JS task. Also restarts the current turn's clock, so call it right before
+ * evaluating the main script. Default: no limits. */
+void qjs_esp_loop_set_limits(qjs_esp_loop_t *loop, const qjs_esp_limits_t *lim);
+
+/* JS task. Absolute esp_timer_get_time() value, 0 for none. Past it, running
+ * JS is interrupted and qjs_esp_loop_run() returns QJS_ESP_STOP_DEADLINE. */
+void qjs_esp_loop_set_deadline(qjs_esp_loop_t *loop, int64_t deadline_us);
+
+/* Any task, not ISRs. Interrupts running JS, wakes the loop if it's idle,
+ * and qjs_esp_loop_run() returns QJS_ESP_STOP_REQUESTED. */
+void qjs_esp_loop_stop(qjs_esp_loop_t *loop);
 
 /* Close every open handle, stop the tasks, free the loop. The modules' JS
  * callbacks (onrecv, onmessage...) don't fire during teardown, but work you

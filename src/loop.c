@@ -18,6 +18,7 @@
 #include "freertos/FreeRTOS.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_vfs_eventfd.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -27,7 +28,7 @@
 
 static const char *TAG = "qjs_loop";
 
-enum { EV_WORK, EV_IO, EV_IO_DONE };
+enum { EV_WORK, EV_IO, EV_IO_DONE, EV_WAKE };
 
 typedef struct {
     uint8_t kind;
@@ -46,6 +47,12 @@ struct qjs_esp_loop {
     QueueHandle_t q;
     TAILQ_HEAD(, qjs_esp_handle) handles;   /* ref'd handles; the loop runs while non-empty */
     JSClassID class_ids[QJS_ESP_CLASS_MAX];
+    /* budget, see qjs_esp_loop_check() */
+    qjs_esp_limits_t lim;
+    int64_t turn_us;            /* this turn (one callback, or one batch of jobs + a timer) started */
+    int64_t ran_us;             /* the JS task last blocked or yielded */
+    int64_t deadline_us;        /* 0: none. JS task only */
+    volatile uint8_t stop;      /* qjs_esp_stop_t, sticky; 0 while running */
     int n_rej;
     int rej_dropped;
     struct {
@@ -129,6 +136,64 @@ void qjs_esp_handle_unref(JSContext *ctx, qjs_esp_handle_t *h)
     TAILQ_REMOVE(&qjs_esp_loop_get(ctx)->handles, h, link);
     h->obj = JS_UNDEFINED;
     JS_FreeValue(ctx, obj);
+}
+
+/* ---- budget ----
+ * Called from QuickJS's interrupt handler (every 10000 branches/calls, regexp
+ * matching included) and from the arena allocator. Once stopped it keeps
+ * saying yes, so whatever JS still runs during teardown bails out at once.
+ * The interrupt can't be caught by try/catch. */
+
+int qjs_esp_loop_check(qjs_esp_loop_t *l, bool read_clock)
+{
+    if (l->stop) {
+        return 1;
+    }
+    if (!read_clock) {
+        return 0;
+    }
+    int64_t now = esp_timer_get_time();
+    if (l->deadline_us && now >= l->deadline_us) {
+        l->stop = QJS_ESP_STOP_DEADLINE;
+        return 1;
+    }
+    if (l->lim.slice_ms && now - l->turn_us >= l->lim.slice_ms * 1000LL) {
+        l->stop = QJS_ESP_STOP_SLICE;
+        return 1;
+    }
+    /* A busy script mustn't starve lower priority tasks or the idle task
+     * (task WDT, light sleep). taskYIELD() wouldn't let those run. */
+    if (l->lim.yield_ms && now - l->ran_us >= l->lim.yield_ms * 1000LL) {
+        vTaskDelay(1);
+        l->ran_us = esp_timer_get_time();
+    }
+    return 0;
+}
+
+static int on_interrupt(JSContext *ctx, void *opaque)
+{
+    return qjs_esp_loop_check(opaque, true);
+}
+
+void qjs_esp_loop_set_limits(qjs_esp_loop_t *l, const qjs_esp_limits_t *lim)
+{
+    l->lim = *lim;
+    l->turn_us = l->ran_us = esp_timer_get_time();
+}
+
+void qjs_esp_loop_set_deadline(qjs_esp_loop_t *l, int64_t deadline_us)
+{
+    l->deadline_us = deadline_us;
+}
+
+void qjs_esp_loop_stop(qjs_esp_loop_t *l)
+{
+    if (!l->stop) {
+        l->stop = QJS_ESP_STOP_REQUESTED;
+    }
+    /* full queue: the JS task is busy and will see the flag anyway */
+    ev_t ev = { .kind = EV_WAKE };
+    xQueueSend(l->q, &ev, 0);
 }
 
 /* ---- unhandled rejections ----
@@ -488,6 +553,12 @@ qjs_esp_loop_t *qjs_esp_loop_new(JSContext *ctx)
 #endif
     JS_SetRuntimeOpaque(rt, l);
     JS_SetHostPromiseRejectionTracker(rt, on_rejection, l);
+    l->turn_us = l->ran_us = esp_timer_get_time();
+    JS_SetInterruptHandler(rt, on_interrupt, l);
+    qjs_esp_arena_t *a = qjs_esp_arena_of(rt);
+    if (a) {
+        qjs_esp_arena_bind(a, l);
+    }
     return l;
 }
 
@@ -499,14 +570,26 @@ static TickType_t ms_to_ticks(int ms)
     return t >= portMAX_DELAY ? portMAX_DELAY - 1 : (TickType_t)t;
 }
 
-void qjs_esp_loop_run(qjs_esp_loop_t *l)
+qjs_esp_stop_t qjs_esp_loop_run(qjs_esp_loop_t *l)
 {
     JSContext *ctx = l->ctx;
 
     for (;;) {
+        /* the interrupt handler only sees the deadline while JS runs */
+        if (!l->stop && l->deadline_us && esp_timer_get_time() >= l->deadline_us) {
+            l->stop = QJS_ESP_STOP_DEADLINE;
+        }
+        if (l->stop) {
+            return l->stop;
+        }
+        l->turn_us = esp_timer_get_time();
         int delay = js_std_loop_once(ctx);
         if (delay == -2) {
-            js_std_dump_error(ctx);     /* a job or timer threw; keep going */
+            if (l->stop) {
+                JS_FreeValue(ctx, JS_GetException(ctx));    /* just the interrupt */
+            } else {
+                js_std_dump_error(ctx);     /* a job or timer threw; keep going */
+            }
             continue;
         }
         if (!JS_IsJobPending(JS_GetRuntime(ctx))) {
@@ -517,13 +600,27 @@ void qjs_esp_loop_run(qjs_esp_loop_t *l)
         if (delay >= 0) {
             wait = ms_to_ticks(delay);
         } else if (TAILQ_EMPTY(&l->handles) && uxQueueMessagesWaiting(l->q) == 0) {
-            return;     /* no timers, no jobs, nothing open */
+            return QJS_ESP_STOP_IDLE;   /* no timers, no jobs, nothing open */
         } else {
             wait = portMAX_DELAY;
         }
+        if (l->deadline_us) {
+            int64_t left_ms = (l->deadline_us - esp_timer_get_time() + 999) / 1000;
+            TickType_t dl = ms_to_ticks(left_ms > 0 ? (int)(left_ms < INT32_MAX ? left_ms : INT32_MAX) : 0);
+            wait = dl < wait ? dl : wait;
+        }
 
+        /* only a real block counts as giving the CPU away */
+        bool blocks = wait > 0 && uxQueueMessagesWaiting(l->q) == 0;
         ev_t ev;
-        if (xQueueReceive(l->q, &ev, wait) == pdTRUE) {
+        BaseType_t got = xQueueReceive(l->q, &ev, wait);
+        if (blocks) {
+            l->ran_us = esp_timer_get_time();
+        }
+        if (got == pdTRUE) {
+            /* even when stopped: posted work must get to free its arg; any
+             * JS it calls is interrupted on the spot */
+            l->turn_us = esp_timer_get_time();
             dispatch(l, &ev);
         }
     }
@@ -551,6 +648,11 @@ void qjs_esp_loop_free(qjs_esp_loop_t *l)
         }
     }
     flush_rejections(l, false);
+    qjs_esp_arena_t *a = qjs_esp_arena_of(rt);
+    if (a) {
+        qjs_esp_arena_bind(a, NULL);
+    }
+    JS_SetInterruptHandler(rt, NULL, NULL);
     JS_SetHostPromiseRejectionTracker(rt, NULL, NULL);
     JS_SetRuntimeOpaque(rt, NULL);
     loop_free(l);
