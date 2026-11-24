@@ -49,15 +49,16 @@ static const struct {
     /* native builtins that never poll for interrupts, one per loop iteration */
     { .name = "native: alloc+fill", .src = "for (;;) new Array(100000).fill(0)",
       .expect = QJS_ESP_STOP_SLICE, .max_ms = 1000 },
-    /* builtins that neither allocate nor poll: cost of one call, and how long a loop of them runs */
-    { .name = "cost: fill 200k", .src = "const a = new Array(200000).fill(1); let t = Date.now();"
-      " for (let i = 0; i < 5; i++) a.fill(2); console.log('GUARD   one fill(200k):', (Date.now() - t) / 5, 'ms')",
-      .expect = QJS_ESP_STOP_IDLE },
-    { .name = "cost: indexOf 500k", .src = "const s = 'x'.repeat(500000); let t = Date.now();"
-      " for (let i = 0; i < 5; i++) s.indexOf('y'); console.log('GUARD   one indexOf(500k):', (Date.now() - t) / 5, 'ms')",
-      .expect = QJS_ESP_STOP_IDLE },
+    /* builtins that neither allocate nor poll: only the interrupt interval catches these.
+     * One fill(200k) is ~40 ms on the S31 and ~94 ms on the S3 in esp-emu, slower
+     * on silicon; at the default interval (100) a loop of them overruns by ~50
+     * calls. The bound only catches a regression to upstream's 10000 (minutes). */
     { .name = "native: fill 2k", .src = "const a = new Array(2000).fill(1); for (;;) a.fill(2)",
-      .any_stop = true },
+      .any_stop = true, .max_ms = 1000 },
+    { .name = "native: fill 200k", .src = "const a = new Array(200000).fill(1); for (;;) a.fill(2)",
+      .any_stop = true, .max_ms = 10000 },
+    { .name = "native: indexOf 500k", .src = "const s = 'x'.repeat(500000); for (;;) s.indexOf('y')",
+      .any_stop = true, .max_ms = 10000 },
     { .name = "native: sort", .src = "const a = Array.from({ length: 30000 }, (_, i) => -i); for (;;) a.slice().sort()",
       .any_stop = true, .max_ms = 1000 },
     { .name = "recursion", .src = "function f(n) { return f(n + 1) + 1 } f(0)", .expect = QJS_ESP_STOP_IDLE },

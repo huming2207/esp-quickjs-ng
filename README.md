@@ -130,13 +130,64 @@ if (why == QJS_ESP_STOP_IDLE) {
 - **Teardown**: `JS_FreeRuntime()` asserts on any leaked object, so after a stop just reset the
   arena. `qjs_esp_loop_free()` must come first: the I/O and ws tasks point into the arena.
 
-The checks run from QuickJS's interrupt handler, which it calls every 10000 bytecode branches and
-calls, and from the arena allocator (stop flag on every allocation, the clock on every 16th). Once
-stopped, allocations fail. **Known gap**: builtins that neither allocate nor poll (`fill()` on an
-existing array, `indexOf()` on a big string) let a loop of them overrun: on the S31 in esp-emu,
-`for (;;) a.fill(2)` over 2000 elements stopped after 2 s with a 200 ms slice. `examples/guard`
-runs hostile scripts (spin, job chains, timer storms, memory bombs, recursion, ReDoS, idle past
-the deadline, stop from another task) and checks the system heap is untouched after each.
+The checks run from two places:
+
+- **QuickJS's interrupt handler.** QuickJS counts *interrupt points*, not time: loop back-jumps,
+  function calls, and the iterations of a few builtins (`every`, `reduce`, `includes`,
+  `indexOf` on arrays). Every `CONFIG_QJS_ESP_INTERRUPT_INTERVAL` of them it calls the handler
+  (upstream: 10000, here 100 by default; `quickjs.c` is copied to the build dir with that
+  `#define` made overridable, the submodule stays untouched). The handler checks the stop flag,
+  then reads the CPU cycle counter; only when about 1 ms of cycles has gone by does it read
+  `esp_timer_get_time()` and check the slice, deadline and yield. The cycle counter is just a
+  cheap gate, never a clock: its window is sized for the XTAL frequency (the lowest clock DFS
+  runs the CPU at), and it's re-armed whenever the JS task wakes, so DFS, light sleep, tickless
+  idle and core switches only ever make it read the real clock *earlier*.
+- **The arena allocator**: stop flag on every allocation, the clock on every 16th. Once stopped,
+  allocations fail, so allocation-heavy builtins die on their next allocation.
+
+Builtins that neither allocate nor poll (`fill()` on an existing array, `indexOf()` on a big
+string) are only caught by the interval: a loop of them overruns the slice by about
+`INTERRUPT_INTERVAL / 2` builtin calls. On the S31 in esp-emu, `for (;;) a.fill(2)` over 200k
+elements (~40 ms per call) against a 200 ms slice:
+
+| interval | stopped after | bench cost (S31, esp-emu) |
+|---|---|---|
+| 1000 | 19.7 s | none measurable |
+| 100 (default) | ~1.9 s (S3: ~4.6 s) | well under 1% |
+| 10 | 366 ms | ~1% |
+| 1 | | ~12% |
+
+Real chips are slower than esp-emu, so overruns there are longer; check on hardware.
+
+`examples/guard` runs hostile scripts (spin, job chains, timer storms, memory bombs, recursion,
+ReDoS, builtin loops, idle past the deadline, stop from another task) and checks the system heap
+is untouched after each.
+
+## Bytecode
+
+Compile once, skip parsing on every run. A container is a 12-byte header (`"QJBC"`, format,
+flags, length) and the bytecode of one ES module, see `qjs_esp.h`.
+
+```sh
+# on a host: builds tools/qjsc-esp from quickjs/ on first use, so BC_VERSION matches
+python tools/qjs_esp_bc.py compile main.js -o main.qbc        # --strip source|debug
+```
+
+```c
+JSValue ret = qjs_esp_bc_eval(ctx, blob, len);      /* like JS_Eval() of the source */
+uint8_t *c = qjs_esp_bc_compile(ctx, src, len, "main.js", 0, &clen);   /* on the device */
+```
+
+- Bundle local imports into one file first (esbuild, `bun build`). Imports with a `:` (`qjs:os`,
+  `esp:ws`, your own C modules) are left for the device to resolve when the module runs.
+- Keep debug info (the default) if you want `file:line` in errors. `--strip source` drops only
+  the source text `Function.prototype.toString()` would return.
+- Host and device output is byte-identical (`examples/bytecode`: 64-bit macOS vs S3 and S31).
+- **QuickJS doesn't check bytecode.** A damaged or hostile blob can corrupt any memory, arena or
+  not. The container check only catches the wrong file or a truncated one, and QuickJS refuses
+  another `BC_VERSION`. There's no signature check yet: only load bytecode from storage nobody
+  else can write.
+- `QJS_ESP_BC_COMPILE` / `QJS_ESP_BC_LOAD` turn the two halves off.
 
 ## Modules
 
@@ -216,6 +267,9 @@ QuickJS sources are built with `-fno-strict-aliasing`; don't drop it.
 |---|---|---|
 | `QJS_ESP_HEAP_PREFER_PSRAM` | y | JS heap in PSRAM, falls back to internal |
 | `QJS_ESP_STACK_MARGIN` | 4096 | stack kept for native code below the JS recursion limit |
+| `QJS_ESP_INTERRUPT_INTERVAL` | 100 | interrupt points (back-jumps, calls) between interrupt handler runs; upstream 10000 |
+| `QJS_ESP_BC_COMPILE` | y | `qjs_esp_bc_compile()` on the device |
+| `QJS_ESP_BC_LOAD` | y | `qjs_esp_bc_eval()`; unchecked bytecode, see above |
 | `QJS_ESP_EVENT_QUEUE_LEN` | 16 | |
 | `QJS_ESP_MOD_UDP` / `_POSIX_SOCKET` / `_WS` | y | |
 | `QJS_ESP_IO_MAX_WATCHERS` | 8 | sockets watched at once |

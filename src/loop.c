@@ -16,8 +16,10 @@
 #include <sys/select.h>
 #include <unistd.h>
 #include "freertos/FreeRTOS.h"
+#include "esp_cpu.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_clk_tree.h"
 #include "esp_timer.h"
 #include "esp_vfs_eventfd.h"
 #include "freertos/queue.h"
@@ -53,6 +55,8 @@ struct qjs_esp_loop {
     int64_t ran_us;             /* the JS task last blocked or yielded */
     int64_t deadline_us;        /* 0: none. JS task only */
     volatile uint8_t stop;      /* qjs_esp_stop_t, sticky; 0 while running */
+    uint32_t check_cc;          /* cycle count at the last clock read */
+    uint32_t check_cycles;      /* ~1 ms of CPU cycles */
     int n_rej;
     int rej_dropped;
     struct {
@@ -166,19 +170,49 @@ int qjs_esp_loop_check(qjs_esp_loop_t *l, bool read_clock)
     if (l->lim.yield_ms && now - l->ran_us >= l->lim.yield_ms * 1000LL) {
         vTaskDelay(1);
         l->ran_us = esp_timer_get_time();
+        l->check_cc = esp_cpu_get_cycle_count();    /* may have changed core or clock */
     }
     return 0;
 }
 
+/*
+ * With a small CONFIG_QJS_ESP_INTERRUPT_INTERVAL this runs every few
+ * branches, so gate the clock read on the cycle counter: one register read.
+ * The cycle counter is no clock (it follows DFS, stops or goes stale in light
+ * sleep, differs per core, wraps in ~13 s), so it's only a gate:
+ *   - the window is sized for the slowest clock JS can run at (XTAL), so it's
+ *     <= ~1 ms at any CPU frequency from XTAL up; faster clocks just read the
+ *     clock more often
+ *   - it's re-armed whenever the JS task wakes or a turn starts, so whatever
+ *     the counter did while we were blocked doesn't matter
+ *   - a core switch or wrap mid-turn costs at most one extra window
+ * Time itself only ever comes from esp_timer_get_time().
+ */
+static inline void gate_rearm(qjs_esp_loop_t *l)
+{
+    l->check_cc = esp_cpu_get_cycle_count();
+}
+
 static int on_interrupt(JSContext *ctx, void *opaque)
 {
-    return qjs_esp_loop_check(opaque, true);
+    qjs_esp_loop_t *l = opaque;
+    uint32_t cc = esp_cpu_get_cycle_count();
+
+    if (l->stop) {
+        return 1;
+    }
+    if (cc - l->check_cc < l->check_cycles) {
+        return 0;
+    }
+    l->check_cc = cc;
+    return qjs_esp_loop_check(l, true);
 }
 
 void qjs_esp_loop_set_limits(qjs_esp_loop_t *l, const qjs_esp_limits_t *lim)
 {
     l->lim = *lim;
     l->turn_us = l->ran_us = esp_timer_get_time();
+    gate_rearm(l);
 }
 
 void qjs_esp_loop_set_deadline(qjs_esp_loop_t *l, int64_t deadline_us)
@@ -554,6 +588,13 @@ qjs_esp_loop_t *qjs_esp_loop_new(JSContext *ctx)
     JS_SetRuntimeOpaque(rt, l);
     JS_SetHostPromiseRejectionTracker(rt, on_rejection, l);
     l->turn_us = l->ran_us = esp_timer_get_time();
+    /* 1 ms of cycles at XTAL, the lowest CPU clock DFS uses; see on_interrupt() */
+    uint32_t hz = 0;
+    if (esp_clk_tree_src_get_freq_hz(SOC_MOD_CLK_XTAL, ESP_CLK_TREE_SRC_FREQ_PRECISION_CACHED, &hz) != ESP_OK || !hz) {
+        hz = 40 * 1000 * 1000;
+    }
+    l->check_cycles = hz / 1000;
+    gate_rearm(l);
     JS_SetInterruptHandler(rt, on_interrupt, l);
     qjs_esp_arena_t *a = qjs_esp_arena_of(rt);
     if (a) {
@@ -583,6 +624,7 @@ qjs_esp_stop_t qjs_esp_loop_run(qjs_esp_loop_t *l)
             return l->stop;
         }
         l->turn_us = esp_timer_get_time();
+        gate_rearm(l);
         int delay = js_std_loop_once(ctx);
         if (delay == -2) {
             if (l->stop) {
@@ -621,6 +663,7 @@ qjs_esp_stop_t qjs_esp_loop_run(qjs_esp_loop_t *l)
             /* even when stopped: posted work must get to free its arg; any
              * JS it calls is interrupted on the spot */
             l->turn_us = esp_timer_get_time();
+            gate_rearm(l);
             dispatch(l, &ev);
         }
     }

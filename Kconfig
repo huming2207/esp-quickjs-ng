@@ -17,6 +17,43 @@ menu "QuickJS-NG"
             free stack minus this. Native calls made at max JS depth (printf,
             TLS writes...) run in this space.
 
+    config QJS_ESP_INTERRUPT_INTERVAL
+        int "Interrupt check interval (interrupt points)"
+        range 1 10000
+        default 100
+        help
+            A count, not a time: QuickJS runs the interrupt handler (stop,
+            deadline, slice and yield checks) after this many interrupt
+            points, i.e. loop back-jumps, function calls and iterations of a
+            few array builtins. Upstream uses 10000. Other builtins don't
+            count, so a loop doing one heavy builtin per iteration (fill() on
+            a big array, say) can overrun the slice by about half this many
+            builtin calls. Each check costs a function call and a cycle
+            counter read; the real clock is read about once per millisecond.
+            In examples/bench (S31, esp-emu) 100 costs well under 1%, 10
+            about 1%, 1 about 12%. Lower it if overruns matter more.
+
+    menu "Bytecode"
+
+        config QJS_ESP_BC_COMPILE
+            bool "Compile to bytecode on the device"
+            default y
+            help
+                qjs_esp_bc_compile(): source in, bytecode container out, to
+                cache a parsed script in flash for instance. Turn it off when
+                bytecode always comes from a host (tools/qjs_esp_bc.py).
+                JS_Eval() of plain source works either way.
+
+        config QJS_ESP_BC_LOAD
+            bool "Load bytecode"
+            default y
+            help
+                qjs_esp_bc_eval(). QuickJS doesn't check bytecode at all: a
+                damaged or hostile blob can corrupt any memory, and the arena
+                won't help. Only load what you compiled and kept where nobody
+                else can write. There's no signature check (yet).
+    endmenu
+
     config QJS_ESP_EVENT_QUEUE_LEN
         int "Event queue length"
         range 4 256

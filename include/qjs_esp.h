@@ -8,6 +8,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "sdkconfig.h"
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "quickjs.h"
@@ -117,6 +118,36 @@ void qjs_esp_loop_free(qjs_esp_loop_t *loop);
 
 /* Queue cb(ctx, arg) to run in the JS task. Any task; not ISRs. */
 esp_err_t qjs_esp_loop_post(qjs_esp_loop_t *loop, qjs_esp_work_cb_t cb, void *arg, TickType_t wait);
+
+/*
+ * Bytecode container, little endian:
+ *   "QJBC", u8 format (1), u8 flags (0, reserved), u16 0, u32 len, then len
+ *   bytes of QuickJS bytecode (one ES module).
+ * tools/qjs_esp_bc.py makes them on a host. The bytecode only loads on the
+ * same QuickJS-NG version that wrote it (BC_VERSION).
+ */
+#define QJS_ESP_BC_HDR_LEN 12
+
+/* Strip flags for qjs_esp_bc_compile(). Debug info is what gives errors
+ * their file:line, keep it unless you're short of flash. */
+#define QJS_ESP_BC_STRIP_SOURCE 0x01    /* Function.prototype.toString() source */
+#define QJS_ESP_BC_STRIP_DEBUG  0x02    /* line numbers too */
+
+#if CONFIG_QJS_ESP_BC_COMPILE
+/* Compile src as an ES module into a container, js_malloc'd (free
+ * with js_free). Imports aren't resolved here, only when it's evaluated.
+ * NULL with an exception pending on a syntax error. */
+uint8_t *qjs_esp_bc_compile(JSContext *ctx, const char *src, size_t len, const char *name,
+                            int strip, size_t *out_len);
+#endif
+
+#if CONFIG_QJS_ESP_BC_LOAD
+/* Check the container, then load, link and run the module, like JS_Eval() of
+ * its source: returns the module's promise, or JS_EXCEPTION. A malformed
+ * container throws before QuickJS sees any of it, but the bytecode itself is
+ * trusted: see CONFIG_QJS_ESP_BC_LOAD. */
+JSValue qjs_esp_bc_eval(JSContext *ctx, const uint8_t *blob, size_t len);
+#endif
 
 /* Native modules, same calling convention as js_init_module_std(). */
 JSModuleDef *qjs_esp_init_module_udp(JSContext *ctx, const char *name);
