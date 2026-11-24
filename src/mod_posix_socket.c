@@ -547,8 +547,6 @@ static const JSCFunctionListEntry psock_proto[] = {
     JS_CGETSET_DEF("info", psock_info, NULL),
 };
 
-/* ---- namespace helpers ---- */
-
 static JSValue ns_sockaddr_inet(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
 {
     struct sockaddr_storage ss;

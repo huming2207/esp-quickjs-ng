@@ -81,9 +81,6 @@ JSRuntime *qjs_esp_new_runtime(void)
     return new_runtime(&rt_mf, NULL);
 }
 
-/* ---- arena: a private TLSF heap, so JS can't eat anybody else's RAM ----
- * No lock: only the JS task allocates, same as QuickJS itself. */
-
 struct qjs_esp_arena {
     void *mem;
     size_t size;

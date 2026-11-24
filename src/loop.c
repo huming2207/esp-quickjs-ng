@@ -115,8 +115,6 @@ JSClassID qjs_esp_class_id(JSContext *ctx, int which)
     return l ? l->class_ids[which] : 0;
 }
 
-/* ---- handles ---- */
-
 void qjs_esp_handle_init(qjs_esp_handle_t *h, void (*detach)(qjs_esp_handle_t *h))
 {
     h->obj = JS_UNDEFINED;
@@ -142,12 +140,6 @@ void qjs_esp_handle_unref(JSContext *ctx, qjs_esp_handle_t *h)
     h->obj = JS_UNDEFINED;
     JS_FreeValue(ctx, obj);
 }
-
-/* ---- budget ----
- * Called from QuickJS's interrupt handler (every 10000 branches/calls, regexp
- * matching included) and from the arena allocator. Once stopped it keeps
- * saying yes, so whatever JS still runs during teardown bails out at once.
- * The interrupt can't be caught by try/catch. */
 
 int qjs_esp_loop_check(qjs_esp_loop_t *l, bool read_clock)
 {
@@ -176,19 +168,6 @@ int qjs_esp_loop_check(qjs_esp_loop_t *l, bool read_clock)
     return 0;
 }
 
-/*
- * With a small CONFIG_QJS_ESP_INTERRUPT_INTERVAL this runs every few
- * branches, so gate the clock read on the cycle counter: one register read.
- * The cycle counter is no clock (it follows DFS, stops or goes stale in light
- * sleep, differs per core, wraps in ~13 s), so it's only a gate:
- *   - the window is sized for the slowest clock JS can run at (XTAL), so it's
- *     <= ~1 ms at any CPU frequency from XTAL up; faster clocks just read the
- *     clock more often
- *   - it's re-armed whenever the JS task wakes or a turn starts, so whatever
- *     the counter did while we were blocked doesn't matter
- *   - a core switch or wrap mid-turn costs at most one extra window
- * Time itself only ever comes from esp_timer_get_time().
- */
 static inline void gate_rearm(qjs_esp_loop_t *l)
 {
     l->check_cc = esp_cpu_get_cycle_count();
@@ -235,12 +214,6 @@ void qjs_esp_loop_stop(qjs_esp_loop_t *l)
     ev_t ev = { .kind = EV_WAKE };
     xQueueSend(l->q, &ev, 0);
 }
-
-/* ---- unhandled rejections ----
- * Same idea as quickjs-libc's tracker, but print instead of exit(1), and a
- * fixed table instead of a malloc'd list. The tracker runs in the middle of
- * QuickJS rejecting a promise, so it must never run JS or touch the pending
- * exception: when the table is full we only count. */
 
 static void report_rejection(JSContext *ctx, JSValueConst reason)
 {
@@ -296,8 +269,6 @@ static void flush_rejections(qjs_esp_loop_t *l, bool report)
     }
     l->rej_dropped = 0;
 }
-
-/* ---- socket watchers + I/O task ---- */
 
 #if QJS_ESP_HAVE_IO
 
@@ -513,8 +484,6 @@ static void io_deinit(qjs_esp_loop_t *l)
 }
 
 #endif /* QJS_ESP_HAVE_IO */
-
-/* ---- loop ---- */
 
 static void dispatch(qjs_esp_loop_t *l, const ev_t *ev)
 {

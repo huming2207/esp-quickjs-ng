@@ -135,8 +135,6 @@ static int send_close(ws_t *w, const uint8_t *p, size_t n)
     return r;
 }
 
-/* ---- JS-task side of the events the connection task posts ---- */
-
 static void ev_open(JSContext *ctx, void *arg)
 {
     ws_t *w = arg;
@@ -226,8 +224,6 @@ static void ev_closed(JSContext *ctx, void *arg)
     JS_FreeValue(ctx, args[1]);
     qjs_esp_handle_unref(ctx, &w->h);   /* may free w */
 }
-
-/* ---- connection task ---- */
 
 /* we bail out: tell the peer why, report 1006 like browsers do */
 static void fail_with_close(ws_t *w, uint16_t code, const char *msg)
@@ -456,8 +452,6 @@ static void on_header(void *arg, const char *line, int len)
     }
     snprintf(w->protocol, sizeof(w->protocol), "%.*s", len, line);
 }
-
-/* ---- JS class ---- */
 
 static void ws_detach(qjs_esp_handle_t *h)
 {
