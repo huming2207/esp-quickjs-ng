@@ -15,6 +15,8 @@
 
 #define FORMAT 1
 
+#if CONFIG_QJS_ESP_BC_COMPILE
+
 static void put_hdr(uint8_t *p, uint8_t flags, uint32_t len)
 {
     memcpy(p, "QJBC", 4);
@@ -26,8 +28,6 @@ static void put_hdr(uint8_t *p, uint8_t flags, uint32_t len)
     p[10] = len >> 16;
     p[11] = len >> 24;
 }
-
-#if CONFIG_QJS_ESP_BC_COMPILE
 
 uint8_t *qjs_esp_bc_compile(JSContext *ctx, const char *src, size_t len, const char *name,
                             int strip, size_t *out_len)

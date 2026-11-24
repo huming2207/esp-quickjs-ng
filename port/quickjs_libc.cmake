@@ -7,6 +7,7 @@
 #     waitpid/pipe/dup/kill, symlink/readlink/lstat, realpath, mkdtemp, cputime)
 #   - os.platform says "esp-idf", not "wasi"
 #   - no os.Worker: its waker needs pipe() and it asks for a 2 MB pthread stack
+#   - lstat() is declared, for newlib (port/libc_glue.c has it)
 #
 # quickjs.c:
 #   - JS_INTERRUPT_COUNTER_INIT can be set from outside (Kconfig), so the
@@ -38,6 +39,9 @@ function(qjs_esp_gen_libc src out)
         "#ifdef ESP_PLATFORM\n#define OS_PLATFORM \"esp-idf\"\n#else\n#define OS_PLATFORM \"wasi\"\n#endif")
     _qjs_replace_once(c "#if JS_HAVE_THREADS\n#include \"quickjs-c-atomics.h\""
         "#if JS_HAVE_THREADS && !defined(ESP_PLATFORM)\n#include \"quickjs-c-atomics.h\"")
+
+    # newlib (CONFIG_LIBC_NEWLIB) doesn't declare lstat(); port/libc_glue.c defines it
+    set(c "#ifdef ESP_PLATFORM\n#include <sys/stat.h>\nint lstat(const char *path, struct stat *st);\n#endif\n${c}")
 
     _qjs_write_if_changed("${src}" "${out}" "${c}")
 endfunction()
