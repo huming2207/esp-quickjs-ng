@@ -7,6 +7,8 @@
   [txiki.js](https://github.com/saghul/txiki.js) off libuv / libwebsockets onto lwIP and `esp_transport`
 - the libc glue quickjs-libc needs on ESP-IDF, and a PSRAM-aware runtime helper
 
+Docs are in [docs/](docs/README.md), one page per topic.
+
 Needs ESP-IDF >= 6.0. Tested on ESP32-S3 (8 MB octal PSRAM) and ESP32-S31 (16 MB PSRAM) under
 [esp-emu](https://github.com/espressif/esp-emulator); also builds for ESP32-P4.
 
