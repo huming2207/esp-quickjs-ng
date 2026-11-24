@@ -25,9 +25,11 @@ idf_component_register(
         "src/mod_udp.c"
         "src/mod_posix_socket.c"
         "src/mod_ws.c"
+        "src/mod_fetch.c"
+        "src/web.c"
     INCLUDE_DIRS "include" "quickjs"
     PRIV_INCLUDE_DIRS "port/include" "src"
-    PRIV_REQUIRES vfs lwip tcp_transport esp-tls mbedtls http_parser esp_timer heap
+    PRIV_REQUIRES vfs lwip tcp_transport esp-tls mbedtls http_parser esp_timer heap esp_http_client
 )
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE _GNU_SOURCE)

@@ -157,6 +157,29 @@ uint8_t *qjs_esp_bc_compile(JSContext *ctx, const char *src, size_t len, const c
 JSValue qjs_esp_bc_eval(JSContext *ctx, const uint8_t *blob, size_t len, JSModuleDef **mod);
 #endif
 
+/*
+ * setTimeout/setInterval/clearTimeout/clearInterval (needs qjs:os registered
+ * first), TextEncoder/TextDecoder (UTF-8 only), AbortController/AbortSignal.
+ * Skips anything already defined. 0, or -1 with an exception pending.
+ */
+int qjs_esp_add_web_globals(JSContext *ctx);
+
+#if CONFIG_QJS_ESP_FETCH
+/*
+ * fetch(), Headers, Response globals (also does qjs_esp_add_web_globals()).
+ * Call after qjs_esp_loop_new(). Differences from the browser one:
+ *   - body is buffered whole, max CONFIG_QJS_ESP_FETCH_MAX_BODY_KB; no
+ *     streams, so Response.body is null
+ *   - request body: string, ArrayBuffer or view only; http(s) only;
+ *     statusText is always ''
+ *   - no CORS/credentials/cache/mode; redirect: 'manual' returns the 3xx
+ *   - abort rejects at once but the request still finishes in the background
+ *   - extra `timeout` option (ms)
+ * 0, or -1 with an exception pending.
+ */
+int qjs_esp_init_fetch(JSContext *ctx);
+#endif
+
 /* Native modules, same calling convention as js_init_module_std(). */
 JSModuleDef *qjs_esp_init_module_udp(JSContext *ctx, const char *name);
 JSModuleDef *qjs_esp_init_module_posix_socket(JSContext *ctx, const char *name);

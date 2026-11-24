@@ -71,6 +71,13 @@ menu "QuickJS-NG"
         bool "ws (WebSocket client) module"
         default y
 
+    config QJS_ESP_FETCH
+        bool "fetch() (HTTP client, esp_http_client)"
+        default y
+        help
+            qjs_esp_init_fetch(): fetch(), Headers and Response as globals.
+            https: uses the certificate bundle (MBEDTLS_CERTIFICATE_BUNDLE).
+
     menu "Socket I/O"
         depends on QJS_ESP_MOD_UDP || QJS_ESP_MOD_POSIX_SOCKET
 
@@ -158,6 +165,45 @@ menu "QuickJS-NG"
             int "Send / partial frame timeout (ms)"
             range 100 60000
             default 5000
+    endmenu
+
+    menu "fetch"
+        depends on QJS_ESP_FETCH
+
+        config QJS_ESP_FETCH_MAX_INFLIGHT
+            int "Requests running at once"
+            range 1 16
+            default 4
+            help
+                Each one is a task with its own stack. fetch() rejects past it.
+
+        config QJS_ESP_FETCH_MAX_BODY_KB
+            int "Max response body (KiB)"
+            range 1 16384
+            default 512
+            help
+                Bodies are buffered whole (no streams), in PSRAM when there is
+                some. A bigger one rejects the fetch.
+
+        config QJS_ESP_FETCH_TIMEOUT_MS
+            int "Default timeout (ms)"
+            range 1000 600000
+            default 30000
+            help
+                Per request, for connect and each network read. fetch()'s
+                non-standard `timeout` option overrides it.
+
+        config QJS_ESP_FETCH_TASK_STACK
+            int "Request task stack size"
+            range 4096 32768
+            default 8192
+            help
+                TLS handshakes need most of it.
+
+        config QJS_ESP_FETCH_TASK_PRIO
+            int "Request task priority"
+            range 1 24
+            default 5
     endmenu
 
 endmenu
