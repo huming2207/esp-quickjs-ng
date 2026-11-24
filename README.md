@@ -58,7 +58,9 @@ static void js_task(void *arg)
 xTaskCreate(js_task, "js", 16 * 1024, NULL, 5, NULL);
 ```
 
-`qjs_esp_loop_post(loop, cb, arg, wait)` runs `cb(ctx, arg)` in the JS task, from any other task.
+`qjs_esp_loop_post(loop, cb, arg, wait)` runs `cb(ctx, arg)` in the JS task, from any other task. A host that calls
+into a script now and then turns on `qjs_esp_loop_keep_alive(loop, true)` so the loop waits for
+the next post instead of returning once the script is done, and ends it with `qjs_esp_loop_stop()`.
 
 See `examples/basic`, `examples/network` and `examples/bench`.
 

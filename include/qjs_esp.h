@@ -6,6 +6,7 @@
  */
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include "sdkconfig.h"
@@ -108,6 +109,11 @@ void qjs_esp_loop_set_deadline(qjs_esp_loop_t *loop, int64_t deadline_us);
 /* Any task, not ISRs. Interrupts running JS, wakes the loop if it's idle,
  * and qjs_esp_loop_run() returns QJS_ESP_STOP_REQUESTED. */
 void qjs_esp_loop_stop(qjs_esp_loop_t *loop);
+
+/* JS task. While on, the loop doesn't return when it runs out of work but
+ * blocks for the next qjs_esp_loop_post(), e.g. for a host that calls into a
+ * script now and then. End it with qjs_esp_loop_stop(). */
+void qjs_esp_loop_keep_alive(qjs_esp_loop_t *loop, bool on);
 
 /* Close every open handle, stop the tasks, free the loop. The modules' JS
  * callbacks (onrecv, onmessage...) don't fire during teardown, but work you

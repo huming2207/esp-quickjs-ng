@@ -55,6 +55,7 @@ struct qjs_esp_loop {
     int64_t ran_us;             /* the JS task last blocked or yielded */
     int64_t deadline_us;        /* 0: none. JS task only */
     volatile uint8_t stop;      /* qjs_esp_stop_t, sticky; 0 while running */
+    bool keep_alive;            /* don't return when out of work */
     uint32_t check_cc;          /* cycle count at the last clock read */
     uint32_t check_cycles;      /* ~1 ms of CPU cycles */
     int n_rej;
@@ -218,6 +219,11 @@ void qjs_esp_loop_set_limits(qjs_esp_loop_t *l, const qjs_esp_limits_t *lim)
 void qjs_esp_loop_set_deadline(qjs_esp_loop_t *l, int64_t deadline_us)
 {
     l->deadline_us = deadline_us;
+}
+
+void qjs_esp_loop_keep_alive(qjs_esp_loop_t *l, bool on)
+{
+    l->keep_alive = on;
 }
 
 void qjs_esp_loop_stop(qjs_esp_loop_t *l)
@@ -641,7 +647,7 @@ qjs_esp_stop_t qjs_esp_loop_run(qjs_esp_loop_t *l)
         TickType_t wait;
         if (delay >= 0) {
             wait = ms_to_ticks(delay);
-        } else if (TAILQ_EMPTY(&l->handles) && uxQueueMessagesWaiting(l->q) == 0) {
+        } else if (!l->keep_alive && TAILQ_EMPTY(&l->handles) && uxQueueMessagesWaiting(l->q) == 0) {
             return QJS_ESP_STOP_IDLE;   /* no timers, no jobs, nothing open */
         } else {
             wait = portMAX_DELAY;
