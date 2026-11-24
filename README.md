@@ -174,7 +174,7 @@ python tools/qjs_esp_bc.py compile main.js -o main.qbc        # --strip source|d
 ```
 
 ```c
-JSValue ret = qjs_esp_bc_eval(ctx, blob, len);      /* like JS_Eval() of the source */
+JSValue ret = qjs_esp_bc_eval(ctx, blob, len, NULL); /* like JS_Eval() of the source */
 uint8_t *c = qjs_esp_bc_compile(ctx, src, len, "main.js", 0, &clen);   /* on the device */
 ```
 

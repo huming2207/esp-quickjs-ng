@@ -38,7 +38,7 @@ static void run(qjs_esp_arena_t *ar, const uint8_t *blob, size_t len, char *out,
     js_init_module_os(ctx, "qjs:os");
     qjs_esp_loop_t *loop = qjs_esp_loop_new(ctx);
 
-    JSValue ret = qjs_esp_bc_eval(ctx, blob, len);
+    JSValue ret = qjs_esp_bc_eval(ctx, blob, len, NULL);
     JSValue r;
     if (JS_IsException(ret)) {
         r = JS_GetException(ctx);

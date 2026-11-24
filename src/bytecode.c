@@ -61,8 +61,11 @@ uint8_t *qjs_esp_bc_compile(JSContext *ctx, const char *src, size_t len, const c
 
 #if CONFIG_QJS_ESP_BC_LOAD
 
-JSValue qjs_esp_bc_eval(JSContext *ctx, const uint8_t *blob, size_t len)
+JSValue qjs_esp_bc_eval(JSContext *ctx, const uint8_t *blob, size_t len, JSModuleDef **mod)
 {
+    if (mod) {
+        *mod = NULL;
+    }
     if (len < QJS_ESP_BC_HDR_LEN || memcmp(blob, "QJBC", 4) || blob[4] != FORMAT || blob[5] || blob[6] || blob[7]) {
         return JS_ThrowTypeError(ctx, "not a bytecode container");
     }
@@ -86,6 +89,9 @@ JSValue qjs_esp_bc_eval(JSContext *ctx, const uint8_t *blob, size_t len)
     if (js_module_set_import_meta(ctx, obj, false, true) < 0) {
         JS_FreeValue(ctx, obj);
         return JS_EXCEPTION;
+    }
+    if (mod) {
+        *mod = JS_VALUE_GET_PTR(obj);   /* the context keeps it after the eval */
     }
     return JS_EvalFunction(ctx, obj);   /* frees obj */
 }

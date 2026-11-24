@@ -145,8 +145,10 @@ uint8_t *qjs_esp_bc_compile(JSContext *ctx, const char *src, size_t len, const c
 /* Check the container, then load, link and run the module, like JS_Eval() of
  * its source: returns the module's promise, or JS_EXCEPTION. A malformed
  * container throws before QuickJS sees any of it, but the bytecode itself is
- * trusted: see CONFIG_QJS_ESP_BC_LOAD. */
-JSValue qjs_esp_bc_eval(JSContext *ctx, const uint8_t *blob, size_t len);
+ * trusted: see CONFIG_QJS_ESP_BC_LOAD.
+ * mod (may be NULL) gets the module once it's linked, for
+ * JS_GetModuleNamespace(); it lives as long as the context. */
+JSValue qjs_esp_bc_eval(JSContext *ctx, const uint8_t *blob, size_t len, JSModuleDef **mod);
 #endif
 
 /* Native modules, same calling convention as js_init_module_std(). */
