@@ -4,7 +4,7 @@
 
 | Example | What it shows |
 |---|---|
-| `basic` | timers, promises, uncaught errors that don't kill the loop |
+| `basic` | timers, promises, uncaught errors that don't kill the loop, the error handler |
 | `network` | udp, posix-socket and WebSocket against an echo server, plus idle CPU |
 | `bench` | a few workloads with wall time and CPU cycles |
 | `guard` | about 20 hostile scripts against the arena and the limits |

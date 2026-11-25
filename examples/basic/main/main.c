@@ -13,6 +13,21 @@
 
 static const char *TAG = "basic";
 
+static int n_errors, n_rejections;
+
+static void on_error(JSContext *ctx, qjs_esp_uncaught_t what, JSValueConst err, void *arg)
+{
+    const char *msg = JS_ToCString(ctx, err);
+    ESP_LOGI(TAG, "error handler: %s: %s", what == QJS_ESP_UNHANDLED_REJECTION ? "rejection" : "error",
+             msg ? msg : "?");
+    JS_FreeCString(ctx, msg);
+    if (what == QJS_ESP_UNHANDLED_REJECTION) {
+        n_rejections++;
+    } else {
+        n_errors++;
+    }
+}
+
 extern const char main_js[] asm("_binary_main_js_start");
 extern const char main_js_end[] asm("_binary_main_js_end");
 
@@ -28,6 +43,7 @@ static void js_task(void *arg)
     js_init_module_std(ctx, "qjs:std");
     js_init_module_os(ctx, "qjs:os");
     qjs_esp_loop_t *loop = qjs_esp_loop_new(ctx);
+    qjs_esp_loop_set_error_handler(loop, on_error, NULL);
 
     /* EMBED_TXTFILES adds a NUL, don't count it */
     JSValue ret = JS_Eval(ctx, main_js, main_js_end - main_js - 1, "main.js", JS_EVAL_TYPE_MODULE);
@@ -39,6 +55,7 @@ static void js_task(void *arg)
         qjs_esp_loop_run(loop);
     }
 
+    ESP_LOGI(TAG, "error handler saw %d error(s), %d rejection(s) (expected 1, 1)", n_errors, n_rejections);
     qjs_esp_loop_free(loop);
     js_std_free_handlers(rt);
     JS_FreeContext(ctx);

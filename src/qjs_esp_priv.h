@@ -30,6 +30,9 @@
 
 #define countof(a) (sizeof(a) / sizeof((a)[0]))
 
+/* Takes the pending exception: the loop's error handler sees it, then stderr. */
+void qjs_esp_report_error(JSContext *ctx, qjs_esp_uncaught_t what);
+
 /*
  * Something that keeps the loop alive: an open socket, a receiving UDP handle,
  * a connecting/open websocket. While ref'd, the loop holds a reference to the

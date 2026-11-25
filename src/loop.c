@@ -55,6 +55,8 @@ struct qjs_esp_loop {
     int64_t ran_us;             /* the JS task last blocked or yielded */
     int64_t deadline_us;        /* 0: none. JS task only */
     volatile uint8_t stop;      /* qjs_esp_stop_t, sticky; 0 while running */
+    qjs_esp_error_cb_t on_error;
+    void *on_error_arg;
     bool keep_alive;            /* don't return when out of work */
     uint32_t check_cc;          /* cycle count at the last clock read */
     uint32_t check_cycles;      /* ~1 ms of CPU cycles */
@@ -215,11 +217,31 @@ void qjs_esp_loop_stop(qjs_esp_loop_t *l)
     xQueueSend(l->q, &ev, 0);
 }
 
+void qjs_esp_loop_set_error_handler(qjs_esp_loop_t *l, qjs_esp_error_cb_t cb, void *arg)
+{
+    l->on_error = cb;
+    l->on_error_arg = arg;
+}
+
+void qjs_esp_report_error(JSContext *ctx, qjs_esp_uncaught_t what)
+{
+    qjs_esp_loop_t *l = qjs_esp_loop_get(ctx);
+    JSValue e = JS_GetException(ctx);
+    if (l && l->on_error && !JS_IsUncatchableError(e)) {
+        l->on_error(ctx, what, e, l->on_error_arg);
+        JS_FreeValue(ctx, JS_GetException(ctx));    /* whatever the handler left pending */
+    }
+    if (what == QJS_ESP_UNHANDLED_REJECTION) {
+        fprintf(stderr, "Possibly unhandled promise rejection: ");
+    }
+    JS_Throw(ctx, e);
+    js_std_dump_error(ctx);
+}
+
 static void report_rejection(JSContext *ctx, JSValueConst reason)
 {
-    fprintf(stderr, "Possibly unhandled promise rejection: ");
     JS_Throw(ctx, JS_DupValue(ctx, reason));
-    js_std_dump_error(ctx);
+    qjs_esp_report_error(ctx, QJS_ESP_UNHANDLED_REJECTION);
 }
 
 static void on_rejection(JSContext *ctx, JSValueConst promise, JSValueConst reason,
@@ -605,7 +627,7 @@ qjs_esp_stop_t qjs_esp_loop_run(qjs_esp_loop_t *l)
             if (l->stop) {
                 JS_FreeValue(ctx, JS_GetException(ctx));    /* just the interrupt */
             } else {
-                js_std_dump_error(ctx);     /* a job or timer threw; keep going */
+                qjs_esp_report_error(ctx, QJS_ESP_UNCAUGHT_ERROR);     /* a job or timer threw; keep going */
             }
             continue;
         }

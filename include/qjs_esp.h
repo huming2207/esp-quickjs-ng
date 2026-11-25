@@ -115,6 +115,20 @@ void qjs_esp_loop_stop(qjs_esp_loop_t *loop);
  * script now and then. End it with qjs_esp_loop_stop(). */
 void qjs_esp_loop_keep_alive(qjs_esp_loop_t *loop, bool on);
 
+/* What reached an error handler: an exception a timer, promise job or module
+ * callback threw, or a promise rejection still unhandled at the end of a turn. */
+typedef enum {
+    QJS_ESP_UNCAUGHT_ERROR = 0,
+    QJS_ESP_UNHANDLED_REJECTION,
+} qjs_esp_uncaught_t;
+
+typedef void (*qjs_esp_error_cb_t)(JSContext *ctx, qjs_esp_uncaught_t what, JSValueConst err, void *arg);
+
+/* JS task. cb(ctx, what, err, arg) runs in the JS task for every uncaught
+ * error before it's printed to stderr as usual; err is only borrowed. Not
+ * called for the interrupt that stops the loop. NULL: print only. */
+void qjs_esp_loop_set_error_handler(qjs_esp_loop_t *loop, qjs_esp_error_cb_t cb, void *arg);
+
 /* Close every open handle, stop the tasks, free the loop. The modules' JS
  * callbacks (onrecv, onmessage...) don't fire during teardown, but work you
  * queued with qjs_esp_loop_post() still runs, so it can free its arg. A

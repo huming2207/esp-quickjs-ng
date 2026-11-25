@@ -127,7 +127,7 @@ static void udp_on_readable(qjs_esp_io_t *w, int revents)
                 JS_FreeValue(ctx, data);    /* out of memory: drop this one */
                 JS_FreeValue(ctx, addr);
                 JS_FreeValue(ctx, o);
-                js_std_dump_error(ctx);
+                qjs_esp_report_error(ctx, QJS_ESP_UNCAUGHT_ERROR);
                 break;
             }
             JS_DefinePropertyValueStr(ctx, o, "data", data, JS_PROP_C_W_E);

@@ -27,7 +27,7 @@ void qjs_esp_call(JSContext *ctx, JSValueConst fn, JSValueConst this_val, int ar
     /* building an argument ran out of memory: report it, don't hand JS a JS_EXCEPTION */
     for (int i = 0; i < argc; i++) {
         if (JS_IsException(argv[i])) {
-            js_std_dump_error(ctx);
+            qjs_esp_report_error(ctx, QJS_ESP_UNCAUGHT_ERROR);
             return;
         }
     }
@@ -39,7 +39,7 @@ void qjs_esp_call(JSContext *ctx, JSValueConst fn, JSValueConst this_val, int ar
     JSValue ret = JS_Call(ctx, f, this_val, argc, argv);
     JS_FreeValue(ctx, f);
     if (JS_IsException(ret)) {
-        js_std_dump_error(ctx);
+        qjs_esp_report_error(ctx, QJS_ESP_UNCAUGHT_ERROR);
     }
     JS_FreeValue(ctx, ret);
 }

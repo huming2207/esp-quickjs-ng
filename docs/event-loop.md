@@ -60,6 +60,17 @@ qjs_esp_loop_stop(loop);               // end it
 - An uncaught error in a callback is printed and the loop keeps going.
 - Unhandled promise rejections are printed once the job queue is empty, not `exit(1)` like
   upstream.
+- To see them yourself, e.g. to send them to whoever wrote the script, set a handler. It runs in
+  the JS task before the print, and not for the interrupt that stops the loop:
+
+```c
+static void on_error(JSContext *ctx, qjs_esp_uncaught_t what, JSValueConst err, void *arg)
+{
+    // what: QJS_ESP_UNCAUGHT_ERROR or QJS_ESP_UNHANDLED_REJECTION; err is borrowed
+}
+
+qjs_esp_loop_set_error_handler(loop, on_error, NULL);
+```
 
 ## Memory
 
