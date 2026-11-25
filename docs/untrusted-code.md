@@ -32,6 +32,13 @@ Everything the runtime allocates comes from the arena's own TLSF heap, nothing e
 fallback to internal RAM. QuickJS throws "out of memory" a little before the arena is full, so it
 still has room to unwind.
 
+The script can't catch it: QuickJS-NG makes every `InternalError` uncatchable, "out of memory"
+among them, and an async function that dies of one never settles its promise. So the loop stops
+there: `qjs_esp_loop_run()` returns `QJS_ESP_STOP_ERROR` and `qjs_esp_loop_error()` has the text.
+A host that gets an uncatchable error back from its own `JS_Call()` hands it to
+`qjs_esp_loop_fail()`, which does the same unless the error is the loop's own interrupt
+(`qjs_esp_loop_stopping()` is non-zero then).
+
 - Grab it once at boot, it's never freed. Up to 4 arenas.
 - One runtime per arena at a time: `qjs_esp_new_runtime_in()` refuses a non-empty arena.
 - `qjs_esp_arena_used()` / `_peak()` for numbers. A bare runtime is about 160 KB.

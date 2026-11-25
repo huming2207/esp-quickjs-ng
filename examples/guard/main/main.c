@@ -41,8 +41,9 @@ static const struct {
     { .name = "timer storm",
       .src = "import * as os from 'qjs:os'; os.setInterval(() => { for (let i = 0; i < 2000; i++); }, 0)",
       .expect = QJS_ESP_STOP_DEADLINE, .min_beats = 50 },
-    { .name = "array bomb", .src = "const a = []; for (;;) a.push(new Array(10000).fill(1))", .expect = QJS_ESP_STOP_IDLE },
-    { .name = "string bomb", .src = "let s = 'x'; for (;;) s += s", .expect = QJS_ESP_STOP_IDLE },
+    /* "out of memory" is uncatchable: the module's promise is rejected with it and the loop stops */
+    { .name = "array bomb", .src = "const a = []; for (;;) a.push(new Array(10000).fill(1))", .expect = QJS_ESP_STOP_ERROR },
+    { .name = "string bomb", .src = "let s = 'x'; for (;;) s += s", .expect = QJS_ESP_STOP_ERROR },
     /* near the limit even the catch path runs out, so OOM tends to escape */
     { .name = "oom hoarder", .src = "const k = []; for (;;) { try { k.push(new Uint8Array(65536)) } catch (e) {} }",
       .any_stop = true, .max_ms = 1000 },
@@ -73,7 +74,7 @@ static const struct {
     { .name = "normal again", .src = "console.log('still alive')", .expect = QJS_ESP_STOP_IDLE },
 };
 
-static const char *stop_name[] = { "idle", "requested", "deadline", "slice" };
+static const char *stop_name[] = { "idle", "requested", "deadline", "slice", "error" };
 
 static volatile uint32_t beats;
 

@@ -55,6 +55,7 @@ struct qjs_esp_loop {
     int64_t ran_us;             /* the JS task last blocked or yielded */
     int64_t deadline_us;        /* 0: none. JS task only */
     volatile uint8_t stop;      /* qjs_esp_stop_t, sticky; 0 while running */
+    char err[96];               /* QJS_ESP_STOP_ERROR: the uncatchable error's text */
     qjs_esp_error_cb_t on_error;
     void *on_error_arg;
     bool keep_alive;            /* don't return when out of work */
@@ -217,6 +218,29 @@ void qjs_esp_loop_stop(qjs_esp_loop_t *l)
     xQueueSend(l->q, &ev, 0);
 }
 
+qjs_esp_stop_t qjs_esp_loop_stopping(const qjs_esp_loop_t *l)
+{
+    return (qjs_esp_stop_t)l->stop;
+}
+
+void qjs_esp_loop_fail(qjs_esp_loop_t *l, JSValueConst err)
+{
+    if (l->stop) {
+        return;     /* the error is our own interrupt */
+    }
+    /* Out of memory is the usual one; describing it may need memory too. */
+    const char *s = JS_ToCString(l->ctx, err);
+    snprintf(l->err, sizeof(l->err), "%s", s ? s : "InternalError (no memory left to describe it)");
+    JS_FreeCString(l->ctx, s);
+    ESP_LOGE(TAG, "uncatchable error, stopping: %s", l->err);
+    l->stop = QJS_ESP_STOP_ERROR;
+}
+
+const char *qjs_esp_loop_error(const qjs_esp_loop_t *l)
+{
+    return l->stop == QJS_ESP_STOP_ERROR ? l->err : "";
+}
+
 void qjs_esp_loop_set_error_handler(qjs_esp_loop_t *l, qjs_esp_error_cb_t cb, void *arg)
 {
     l->on_error = cb;
@@ -227,7 +251,16 @@ void qjs_esp_report_error(JSContext *ctx, qjs_esp_uncaught_t what)
 {
     qjs_esp_loop_t *l = qjs_esp_loop_get(ctx);
     JSValue e = JS_GetException(ctx);
-    if (l && l->on_error && !JS_IsUncatchableError(e)) {
+    if (JS_IsUncatchableError(e)) {
+        /* Our interrupt, or one the script can't recover from (out of memory;
+         * an async function that dies of it never settles its promise): stop. */
+        if (l) {
+            qjs_esp_loop_fail(l, e);
+        }
+        JS_FreeValue(ctx, e);
+        return;
+    }
+    if (l && l->on_error) {
         l->on_error(ctx, what, e, l->on_error_arg);
         JS_FreeValue(ctx, JS_GetException(ctx));    /* whatever the handler left pending */
     }
@@ -627,7 +660,8 @@ qjs_esp_stop_t qjs_esp_loop_run(qjs_esp_loop_t *l)
             if (l->stop) {
                 JS_FreeValue(ctx, JS_GetException(ctx));    /* just the interrupt */
             } else {
-                qjs_esp_report_error(ctx, QJS_ESP_UNCAUGHT_ERROR);     /* a job or timer threw; keep going */
+                /* a job or timer threw: keep going, unless it was uncatchable */
+                qjs_esp_report_error(ctx, QJS_ESP_UNCAUGHT_ERROR);
             }
             continue;
         }

@@ -65,6 +65,8 @@ typedef enum {
     QJS_ESP_STOP_REQUESTED,     /* qjs_esp_loop_stop() */
     QJS_ESP_STOP_DEADLINE,      /* qjs_esp_loop_set_deadline() passed */
     QJS_ESP_STOP_SLICE,         /* one turn ran longer than slice_ms */
+    QJS_ESP_STOP_ERROR,         /* an uncatchable error the loop didn't cause, e.g. out of
+                                 * memory; qjs_esp_loop_error() has its text */
 } qjs_esp_stop_t;
 
 typedef struct {
@@ -95,8 +97,24 @@ qjs_esp_loop_t *qjs_esp_loop_new(JSContext *ctx);
 
 /* Run until there are no timers, jobs or open handles left, or until it's
  * stopped (see qjs_esp_stop_t). Uncaught errors are printed and the loop keeps
- * going. */
+ * going, except uncatchable ones: QuickJS makes every InternalError, "out of
+ * memory" among them, uncatchable, and an async function that dies of one never
+ * settles its promise. The loop stops with QJS_ESP_STOP_ERROR instead of leaving
+ * whoever awaits it waiting. */
 qjs_esp_stop_t qjs_esp_loop_run(qjs_esp_loop_t *loop);
+
+/* JS task. Why the loop is stopping, or QJS_ESP_STOP_IDLE (0) while it runs.
+ * An uncatchable error seen while this is non-zero is the loop's own interrupt. */
+qjs_esp_stop_t qjs_esp_loop_stopping(const qjs_esp_loop_t *loop);
+
+/* JS task. For a host that gets an uncatchable error back from its own
+ * JS_Call(): unless the loop is already stopping (then the error is its
+ * interrupt), stop it with QJS_ESP_STOP_ERROR and keep the error's text.
+ * Running JS is interrupted and qjs_esp_loop_run() returns. */
+void qjs_esp_loop_fail(qjs_esp_loop_t *loop, JSValueConst err);
+
+/* JS task. The text of the error behind QJS_ESP_STOP_ERROR; "" otherwise. */
+const char *qjs_esp_loop_error(const qjs_esp_loop_t *loop);
 
 /* JS task. Also restarts the current turn's clock, so call it right before
  * evaluating the main script. Default: no limits. */
@@ -126,7 +144,8 @@ typedef void (*qjs_esp_error_cb_t)(JSContext *ctx, qjs_esp_uncaught_t what, JSVa
 
 /* JS task. cb(ctx, what, err, arg) runs in the JS task for every uncaught
  * error before it's printed to stderr as usual; err is only borrowed. Not
- * called for the interrupt that stops the loop. NULL: print only. */
+ * called for the interrupt that stops the loop, nor for an uncatchable error
+ * (that stops it with QJS_ESP_STOP_ERROR). NULL: print only. */
 void qjs_esp_loop_set_error_handler(qjs_esp_loop_t *loop, qjs_esp_error_cb_t cb, void *arg);
 
 /* Close every open handle, stop the tasks, free the loop. The modules' JS

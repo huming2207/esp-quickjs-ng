@@ -124,7 +124,8 @@ if (why == QJS_ESP_STOP_IDLE) {
 ```
 
 - **Memory**: everything QuickJS allocates comes from the arena, nothing else. QuickJS throws
-  "out of memory" a little before it's full. `qjs_esp_new_runtime()` instead shares the system
+  "out of memory" a little before it's full. QuickJS-NG makes that error uncatchable, so the loop
+  returns `QJS_ESP_STOP_ERROR` and `qjs_esp_loop_error()` says why. `qjs_esp_new_runtime()` instead shares the system
   heap and falls back to internal RAM.
 - **Stack**: the JS recursion limit comes from the task's stack, as with `qjs_esp_new_runtime()`.
 - **Time**: `slice_ms` caps one turn (a callback, or a batch of promise jobs plus one timer), the

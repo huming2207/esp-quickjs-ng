@@ -40,6 +40,7 @@ something stopped it. It tells you which:
 | `QJS_ESP_STOP_REQUESTED` | someone called `qjs_esp_loop_stop()` |
 | `QJS_ESP_STOP_DEADLINE` | past `qjs_esp_loop_set_deadline()` |
 | `QJS_ESP_STOP_SLICE` | one turn ran longer than `slice_ms` |
+| `QJS_ESP_STOP_ERROR` | an uncatchable error the loop didn't cause, e.g. out of memory; `qjs_esp_loop_error()` has its text |
 
 Anything but `IDLE` is final: free the loop. See [Untrusted code](untrusted-code.md) for the
 limits.
