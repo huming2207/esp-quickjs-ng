@@ -12,6 +12,7 @@ device. The device runs the bytecode as it is, there's no signature (yet).
 """
 
 import argparse
+import contextlib
 import os
 import struct
 import subprocess
@@ -22,15 +23,43 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FORMAT = 1
 
 
+@contextlib.contextmanager
+def build_lock(build_dir):
+    """A parallel build runs several compiles at once; without this they all
+    configure and build the host compiler in the same directory, and one links
+    while another rewrites the library (undefined references)."""
+    os.makedirs(build_dir, exist_ok=True)
+    with open(os.path.join(build_dir, '.lock'), 'a+') as f:
+        try:
+            import fcntl
+        except ImportError:  # Windows: lock the file's first byte
+            import msvcrt
+            while True:
+                try:
+                    msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)  # gives up after 10 s
+                    break
+                except OSError:
+                    pass
+            try:
+                yield
+            finally:
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            yield  # closing the file releases it
+
+
 def host_compiler(build_dir):
     exe = os.path.join(build_dir, 'qjsc-esp')
     src = os.path.join(HERE, 'qjsc-esp')
-    if not os.path.exists(os.path.join(build_dir, 'CMakeCache.txt')):
-        subprocess.run(['cmake', '-S', src, '-B', build_dir, '-DCMAKE_BUILD_TYPE=Release'],
+    with build_lock(build_dir):
+        if not os.path.exists(os.path.join(build_dir, 'CMakeCache.txt')):
+            subprocess.run(['cmake', '-S', src, '-B', build_dir, '-DCMAKE_BUILD_TYPE=Release'],
+                           check=True, stdout=subprocess.DEVNULL)
+        # a no-op when up to date; rebuilds after a quickjs bump
+        subprocess.run(['cmake', '--build', build_dir, '--target', 'qjsc-esp'],
                        check=True, stdout=subprocess.DEVNULL)
-    # a no-op when up to date; rebuilds after a quickjs bump
-    subprocess.run(['cmake', '--build', build_dir, '--target', 'qjsc-esp'],
-                   check=True, stdout=subprocess.DEVNULL)
     return exe
 
 
