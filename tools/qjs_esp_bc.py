@@ -3,7 +3,7 @@
 """
 Bytecode containers for esp-quickjs-ng (format in include/qjs_esp.h).
 
-  qjs_esp_bc.py compile main.js -o main.qbc [--strip source|debug]
+  qjs_esp_bc.py compile main.js -o main.qbc [--strip source|debug] [--script]
 
 compile builds tools/qjsc-esp from the quickjs/ submodule on first use (needs
 cmake and a C compiler), so the bytecode matches the device's QuickJS version.
@@ -38,6 +38,8 @@ def cmd_compile(a):
     qjsc = a.qjsc or host_compiler(a.build_dir)
     name = a.name or os.path.basename(a.input)
     strip = {'none': [], 'source': ['-s'], 'debug': ['-ss']}[a.strip]
+    if a.script:
+        strip.append('-e')
 
     with tempfile.TemporaryDirectory() as tmp:
         raw = os.path.join(tmp, 'out.bc')
@@ -63,6 +65,8 @@ def main():
     c.add_argument('--name', help='file name in stack traces (default: input basename)')
     c.add_argument('--strip', choices=['none', 'source', 'debug'], default='none',
                    help="source: drop source text; debug: line numbers too (errors lose file:line)")
+    c.add_argument('--script', action='store_true',
+                   help='a global script that may use top-level await, not a module (for runtimes that eval snippets)')
     c.add_argument('--qjsc', help='use this qjsc-esp instead of building one')
     c.add_argument('--build-dir', default=os.path.join(HERE, 'qjsc-esp', 'build'))
     c.set_defaults(fn=cmd_compile)

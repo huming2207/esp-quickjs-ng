@@ -19,6 +19,10 @@ the chip makes from the same source (checked on macOS arm64 vs S3 and S31).
 - Imports with a `:` in them (`qjs:os`, `esp:ws`, your C modules) are left alone; the device
   resolves them when the module runs.
 - Keep debug info unless you're short on flash, or every error loses its `file:line`.
+- `--script` compiles a global script that may use top-level `await` instead of a module, for
+  REPL-style evals. `qjs_esp_bc_eval()` only takes modules: read the bytecode with
+  `JS_ReadObject()`, check it is a `JS_TAG_FUNCTION_BYTECODE`, and `JS_EvalFunction()` it. You get
+  a promise of `{ value }`, the last statement's value; its `var`s stay in the globals.
 
 ## On the chip
 

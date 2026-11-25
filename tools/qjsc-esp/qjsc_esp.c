@@ -1,8 +1,9 @@
 /*
- * qjsc-esp [-s|-ss] [-n name] in.js out.bc
+ * qjsc-esp [-s|-ss] [-e] [-n name] in.js out.bc
  *
  * Compile one ES module to raw QuickJS bytecode, the same thing
- * qjs_esp_bc_compile() does on the device. Unlike qjsc, imports aren't
+ * qjs_esp_bc_compile() does on the device. With -e it's a global script
+ * that may use top-level await instead, for runtimes that eval snippets. Unlike qjsc, imports aren't
  * resolved here: the device resolves si:*, qjs:* and friends when it runs
  * the module. Bundle local files into one first (esbuild/bun build).
  *
@@ -71,7 +72,7 @@ static char *read_file(const char *path, size_t *len)
 
 int main(int argc, char **argv)
 {
-    int strip = 0, i = 1;
+    int strip = 0, i = 1, script = 0;
     const char *name = NULL;
 
     for (; i < argc && argv[i][0] == '-'; i++) {
@@ -79,6 +80,8 @@ int main(int argc, char **argv)
             strip = 1;
         } else if (!strcmp(argv[i], "-ss")) {
             strip = 2;
+        } else if (!strcmp(argv[i], "-e")) {
+            script = 1;
         } else if (!strcmp(argv[i], "-n") && i + 1 < argc) {
             name = argv[++i];
         } else {
@@ -86,7 +89,7 @@ int main(int argc, char **argv)
         }
     }
     if (argc - i != 2) {
-        fprintf(stderr, "usage: qjsc-esp [-s|-ss] [-n name] in.js out.bc\n");
+        fprintf(stderr, "usage: qjsc-esp [-s|-ss] [-e] [-n name] in.js out.bc\n");
         return 2;
     }
     const char *in = argv[i], *out = argv[i + 1];
@@ -101,7 +104,8 @@ int main(int argc, char **argv)
     JSRuntime *rt = JS_NewRuntime();
     JSContext *ctx = JS_NewContext(rt);
     JS_SetModuleLoaderFunc(rt, NULL, loader, NULL);
-    JSValue fn = JS_Eval(ctx, src, len, name ? name : in, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    int type = script ? JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_ASYNC : JS_EVAL_TYPE_MODULE;
+    JSValue fn = JS_Eval(ctx, src, len, name ? name : in, type | JS_EVAL_FLAG_COMPILE_ONLY);
     free(src);
     if (JS_IsException(fn)) {
         dump_error(ctx);
