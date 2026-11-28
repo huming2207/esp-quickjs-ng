@@ -150,7 +150,9 @@ void qjs_esp_loop_set_error_handler(qjs_esp_loop_t *loop, qjs_esp_error_cb_t cb,
 
 /* Close every open handle, stop the tasks, free the loop. The modules' JS
  * callbacks (onrecv, onmessage...) don't fire during teardown, but work you
- * queued with qjs_esp_loop_post() still runs, so it can free its arg. A
+ * queued with qjs_esp_loop_post() still runs, so it can free its arg; the
+ * loop is stopping by then (qjs_esp_loop_stopping() isn't IDLE), so such work
+ * should free and not call JS, which would be interrupted anyway. A
  * websocket still connecting holds this up to its connect timeout.
  * Call before JS_FreeContext(). NULL is fine. */
 void qjs_esp_loop_free(qjs_esp_loop_t *loop);

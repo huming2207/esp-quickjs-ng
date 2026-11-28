@@ -41,6 +41,8 @@ typedef struct {
     void *arg;
 } ev_t;
 
+static void dispatch(qjs_esp_loop_t *l, const ev_t *ev);
+
 /* rejections seen in one turn before a .catch() could run; overflow is only counted */
 #define MAX_REJECTIONS 16
 
@@ -525,9 +527,15 @@ static void io_deinit(qjs_esp_loop_t *l)
         io_wake(l);
         /* wait for EV_IO_DONE; anything else in the queue is stale by now */
         ev_t ev;
-        do {
+        for (;;) {
             xQueueReceive(l->q, &ev, portMAX_DELAY);
-        } while (ev.kind != EV_IO_DONE);
+            if (ev.kind == EV_IO_DONE) {
+                break;
+            }
+            if (ev.kind == EV_WORK) { /* posted work still gets to free its arg */
+                dispatch(l, &ev);
+            }
+        }
     }
     if (l->io_wake >= 0) {
         close(l->io_wake);
@@ -706,6 +714,12 @@ void qjs_esp_loop_free(qjs_esp_loop_t *l)
         return;
     }
     JSRuntime *rt = JS_GetRuntime(l->ctx);
+    /* Stopping from here even if the loop went idle by itself: the work that
+     * still runs sees qjs_esp_loop_stopping() and any JS it calls is
+     * interrupted. */
+    if (!l->stop) {
+        l->stop = QJS_ESP_STOP_REQUESTED;
+    }
 
     /* Detach everything. Sockets close on the spot; websockets have a task
      * to stop and unref themselves from its final event, so keep draining. */
@@ -719,6 +733,14 @@ void qjs_esp_loop_free(qjs_esp_loop_t *l)
             dispatch(l, &ev);
         } else {
             ESP_LOGW(TAG, "still waiting for handles to close");
+        }
+    }
+    /* With no handles open nothing above read the queue: run the work still
+     * in it, as qjs_esp_loop_free() promises. I/O events are stale by now. */
+    ev_t ev;
+    while (xQueueReceive(l->q, &ev, 0) == pdTRUE) {
+        if (ev.kind == EV_WORK) {
+            dispatch(l, &ev);
         }
     }
     flush_rejections(l, false);
